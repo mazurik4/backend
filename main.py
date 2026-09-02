@@ -2,24 +2,27 @@
 Простой бэкенд для сайта "Автодіагностика — Київ".
 
 Что он делает:
-1. Принимает заявки с формы (POST /api/callback) и сохраняет их в SQL-базу (SQLite).
+1. Принимает заявки с формы (POST /api/callback) и сохраняет их в базу Postgres (Neon.tech).
 2. Даёт админу посмотреть все заявки (GET /api/requests) — с защитой секретным ключом.
 3. Даёт возможность отметить заявку как обработанную (PATCH /api/requests/{id}).
 4. Отдаёт сам сайт (html/css/js) — чтобы всё работало из одного места.
 
-Как запустить (см. также README.md):
+Как запустить локально:
     pip install -r requirements.txt
+    (Windows PowerShell) $env:DATABASE_URL="ваша-строка-подключения-от-neon"
+    (Windows PowerShell) $env:ADMIN_KEY="ваш-ключ"
     uvicorn main:app --reload
 Потом открыть в браузере: http://127.0.0.1:8000
-Автодокументация API (можно потыкать запросы руками): http://127.0.0.1:8000/docs
+Автодокументация API: http://127.0.0.1:8000/docs
 """
 
 import os
 import re
-import sqlite3
 from datetime import datetime
 from pathlib import Path
 
+import psycopg2
+import psycopg2.extras
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -30,18 +33,24 @@ from pydantic import BaseModel, field_validator
 # ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).parent
-DB_PATH = BASE_DIR / "requests.db"         
-STATIC_DIR = BASE_DIR / "static"           # тут лежат index.html, style.css, script.js
+STATIC_DIR = BASE_DIR / "static"            # тут лежат index.html, style.css, script.js
 
-# Секретный ключ для доступа к списку заявок.
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "change-me-locally-for-dev")  # лучше задать через переменную окружения
+# Строка подключения к базе Postgres (Neon.tech) — задаётся через переменную
+# окружения DATABASE_URL, никогда не хранится в коде.
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError(
+        "Не задана переменная окружения DATABASE_URL. "
+        "Локально: $env:DATABASE_URL=\"ваша-строка-от-neon\" перед запуском uvicorn. "
+        "На Render: добавьте её в Environment Variables."
+    )
+
+# Ключ для доступа к списку заявок — тоже из переменной окружения.
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "change-me-locally-for-dev")
 
 app = FastAPI(title="Автодіагностика — бекенд")
 
-# CORS нужен, если фронтенд будет открываться отдельно от бэкенда
-# (например, index.html открыт напрямую файлом, а API — на localhost:8000).
-# Если отдаёшь сайт этим же бэкендом (как ниже), CORS не обязателен,
-# но не мешает оставить на всякий случай.
+# CORS: разрешаем запросы к API только с вашего сайта, а не с любого сайта в интернете.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -54,36 +63,34 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Работа с базой данных (обычный SQL, без ORM — чтобы было видно, что происходит)
+# Работа с базой данных (Postgres через psycopg2)
 # ---------------------------------------------------------------------------
 
-def get_db() -> sqlite3.Connection:
-    """Открывает соединение с базой. row_factory позволяет получать строки как словари."""
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    # WAL-режим позволяет читать базу, пока идёт запись (и наоборот) —
-    # без него один PATCH/POST блокирует все остальные запросы к базе.
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=30000;")
+def get_db() -> psycopg2.extensions.connection:
+    """Открывает соединение с базой Neon. cursor_factory даёт строки как словари."""
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     return conn
 
 
 def init_db() -> None:
     """Создаёт таблицу для заявок, если её ещё нет."""
     conn = get_db()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS callback_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'new'
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS callback_requests (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'new'
+            )
+            """
         )
-        """
-    )
-    conn.commit()
-    conn.close()
+        conn.commit()
+    finally:
+        conn.close()
 
 
 init_db()  # выполняется один раз при старте сервера
@@ -122,15 +129,18 @@ class CallbackRequest(BaseModel):
 def create_callback(data: CallbackRequest):
     """Сюда форма с сайта присылает имя и телефон. Сохраняем в базу."""
     conn = get_db()
-    conn.execute(
-        """
-        INSERT INTO callback_requests (name, phone, created_at, status)
-        VALUES (?, ?, ?, ?)
-        """,
-        (data.name, data.phone, datetime.now().isoformat(timespec="seconds"), "new"),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO callback_requests (name, phone, created_at, status)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (data.name, data.phone, datetime.now().isoformat(timespec="seconds"), "new"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     return {"ok": True, "message": "Заявку прийнято"}
 
 
@@ -145,14 +155,16 @@ def list_requests(x_admin_key: str = Header(default="")):
     """
     Показывает все заявки. Нужно передать заголовок X-Admin-Key с правильным ключом.
     Пример через curl:
-        curl -H "X-Admin-Key: call-backrqst-44qaz" http://127.0.0.1:8000/api/requests
+        curl -H "X-Admin-Key: ваш-ключ" https://ваш-бекенд/api/requests
     """
     check_admin_key(x_admin_key)
     conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM callback_requests ORDER BY id DESC"
-    ).fetchall()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM callback_requests ORDER BY id DESC")
+        rows = cur.fetchall()
+    finally:
+        conn.close()
     return [dict(row) for row in rows]
 
 
@@ -165,13 +177,17 @@ def update_status(
     """Отметить заявку как обработанную, например status=done."""
     check_admin_key(x_admin_key)
     conn = get_db()
-    cursor = conn.execute(
-        "UPDATE callback_requests SET status = ? WHERE id = ?",
-        (status, request_id),
-    )
-    conn.commit()
-    conn.close()
-    if cursor.rowcount == 0:
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE callback_requests SET status = %s WHERE id = %s",
+            (status, request_id),
+        )
+        conn.commit()
+        affected = cur.rowcount
+    finally:
+        conn.close()
+    if affected == 0:
         raise HTTPException(status_code=404, detail="Заявку не знайдено")
     return {"ok": True}
 
