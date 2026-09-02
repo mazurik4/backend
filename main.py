@@ -25,7 +25,6 @@ import psycopg2
 import psycopg2.extras
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 
 # ---------------------------------------------------------------------------
@@ -33,7 +32,8 @@ from pydantic import BaseModel, field_validator
 # ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).parent
-STATIC_DIR = BASE_DIR / "static"            # тут лежат index.html, style.css, script.js
+# Сайт (index.html, style.css, script.js) отдаётся отдельно через GitHub Pages,
+# поэтому этот бэкенд отвечает только за API — раздавать статику ему не нужно.
 
 # Строка подключения к базе Postgres (Neon.tech) — задаётся через переменную
 # окружения DATABASE_URL, никогда не хранится в коде.
@@ -193,8 +193,10 @@ def update_status(
 
 
 # ---------------------------------------------------------------------------
-# Отдаём сам сайт (index.html, style.css, script.js) с этого же сервера.
-# Должно быть ПОСЛЕ всех /api/... маршрутов, иначе они перекроются.
+# Корневой адрес — просто чтобы при заходе на сам бэкенд было понятное
+# сообщение, а не ошибка 404. Сам сайт находится на GitHub Pages.
 # ---------------------------------------------------------------------------
 
-app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "Автодіагностика — бекенд"}
