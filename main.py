@@ -16,6 +16,7 @@
 Автодокументация API: http://127.0.0.1:8000/docs
 """
 
+import io
 import os
 import re
 from datetime import datetime
@@ -23,8 +24,10 @@ from pathlib import Path
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from PIL import Image
 from pydantic import BaseModel, field_validator
 
 # ---------------------------------------------------------------------------
@@ -47,6 +50,11 @@ if not DATABASE_URL:
 
 # Ключ для доступа к списку заявок — тоже из переменной окружения.
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "change-me-locally-for-dev")
+
+# Новини для каруселі на сайті: скільки останніх зберігати і обмеження на вхідні дані.
+NEWS_LIMIT = 5
+NEWS_MAX_TEXT_LEN = 300
+NEWS_IMAGE_MAX_WIDTH = 1200
 
 app = FastAPI(title="Автодіагностика — бекенд")
 
@@ -85,6 +93,17 @@ def init_db() -> None:
                 phone TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'new'
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS news (
+                id SERIAL PRIMARY KEY,
+                text TEXT NOT NULL,
+                image_data BYTEA NOT NULL,
+                image_mime TEXT NOT NULL,
+                created_at TEXT NOT NULL
             )
             """
         )
@@ -189,6 +208,134 @@ def update_status(
         conn.close()
     if affected == 0:
         raise HTTPException(status_code=404, detail="Заявку не знайдено")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Новини (карусель на сайті) — фото + короткий текст, останні NEWS_LIMIT штук.
+# Джерело зараз — ручне додавання власником через static/admin.html.
+# ---------------------------------------------------------------------------
+
+def _compress_image(raw: bytes):
+    """Ужимает фото до разумного размера и перекодирует в JPEG."""
+    try:
+        image = Image.open(io.BytesIO(raw))
+        image = image.convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Файл не є зображенням")
+    if image.width > NEWS_IMAGE_MAX_WIDTH:
+        ratio = NEWS_IMAGE_MAX_WIDTH / image.width
+        image = image.resize((NEWS_IMAGE_MAX_WIDTH, int(image.height * ratio)))
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=82)
+    return buffer.getvalue(), "image/jpeg"
+
+
+def _prune_news(cur) -> None:
+    """Оставляет только NEWS_LIMIT самых новых новостей."""
+    cur.execute(
+        "DELETE FROM news WHERE id NOT IN (SELECT id FROM news ORDER BY id DESC LIMIT %s)",
+        (NEWS_LIMIT,),
+    )
+
+
+@app.get("/api/news")
+def list_news():
+    """Останні новини для каруселі на сайті. Доступно всім, без ключа."""
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, text, created_at FROM news ORDER BY id DESC LIMIT %s",
+            (NEWS_LIMIT,),
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "id": row["id"],
+            "text": row["text"],
+            "created_at": row["created_at"],
+            "image_url": f"/api/news/{row['id']}/image",
+        }
+        for row in rows
+    ]
+
+
+@app.get("/api/news/{news_id}/image")
+def get_news_image(news_id: int):
+    """Отдаёт фото новости как обычную картинку."""
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT image_data, image_mime FROM news WHERE id = %s", (news_id,))
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Новину не знайдено")
+    return Response(
+        content=bytes(row["image_data"]),
+        media_type=row["image_mime"],
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.post("/api/news")
+def create_news(
+    text: str = Form(...),
+    image: UploadFile = File(...),
+    x_admin_key: str = Header(default=""),
+):
+    """Додати новину (для адмінки). Найстаріша зайва — видаляється автоматично."""
+    check_admin_key(x_admin_key)
+    text = text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Текст новини порожній")
+    if len(text) > NEWS_MAX_TEXT_LEN:
+        raise HTTPException(status_code=400, detail=f"Текст довший за {NEWS_MAX_TEXT_LEN} символів")
+
+    image_data, image_mime = _compress_image(image.file.read())
+
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO news (text, image_data, image_mime, created_at)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id, created_at
+            """,
+            (text, psycopg2.Binary(image_data), image_mime, datetime.now().isoformat(timespec="seconds")),
+        )
+        created = cur.fetchone()
+        _prune_news(cur)
+        conn.commit()
+    finally:
+        conn.close()
+    return {
+        "id": created["id"],
+        "text": text,
+        "created_at": created["created_at"],
+        "image_url": f"/api/news/{created['id']}/image",
+    }
+
+
+@app.delete("/api/news/{news_id}")
+def delete_news(news_id: int, x_admin_key: str = Header(default="")):
+    """Видалити новину (виправити помилку публікації)."""
+    check_admin_key(x_admin_key)
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM news WHERE id = %s", (news_id,))
+        conn.commit()
+        affected = cur.rowcount
+    finally:
+        conn.close()
+    if affected == 0:
+        raise HTTPException(status_code=404, detail="Новину не знайдено")
     return {"ok": True}
 
 
