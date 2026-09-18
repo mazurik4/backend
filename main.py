@@ -96,6 +96,11 @@ def init_db() -> None:
             )
             """
         )
+        # Симптом, який клієнт обрав на сайті. Для вже наявної таблиці колонка
+        # додається автоматично, старі заявки отримують порожнє значення.
+        cur.execute(
+            "ALTER TABLE callback_requests ADD COLUMN IF NOT EXISTS symptom TEXT NOT NULL DEFAULT ''"
+        )
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS news (
@@ -122,6 +127,12 @@ init_db()  # выполняется один раз при старте серв
 class CallbackRequest(BaseModel):
     name: str
     phone: str
+    symptom: str = ""  # необов'язкове; старий фронтенд його не надсилає
+
+    @field_validator("symptom")
+    @classmethod
+    def symptom_trim(cls, value: str) -> str:
+        return value.strip()[:100]
 
     @field_validator("name")
     @classmethod
@@ -152,10 +163,10 @@ def create_callback(data: CallbackRequest):
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO callback_requests (name, phone, created_at, status)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO callback_requests (name, phone, created_at, status, symptom)
+            VALUES (%s, %s, %s, %s, %s)
             """,
-            (data.name, data.phone, datetime.now().isoformat(timespec="seconds"), "new"),
+            (data.name, data.phone, datetime.now().isoformat(timespec="seconds"), "new", data.symptom),
         )
         conn.commit()
     finally:
