@@ -1,0 +1,14 @@
+name: Keep backend warm
+
+on:
+  schedule:
+    # каждые 10 минут — чуть чаще, чем Render засыпает (15 мин простоя на бесплатном тарифе)
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping backend
+        run: curl -fsS --max-time 50 https://backend-cmr4.onrender.com/ || true
