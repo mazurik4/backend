@@ -10,5 +10,8 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping backend
-        run: curl -fsS --max-time 50 https://backend-cmr4.onrender.com/ || true
+      # Бьём именно в /api/news, а не в "/" — этот маршрут обращается к базе
+      # Neon, у которой своё отдельное автозасыпание. Пинг "/" будил бы только
+      # Render, а Neon всё равно засыпала бы и тормозила первый реальный запрос.
+      - name: Ping backend (and its database)
+        run: curl -fsS --max-time 50 https://backend-cmr4.onrender.com/api/news || true
