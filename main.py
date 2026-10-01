@@ -24,6 +24,7 @@ from pathlib import Path
 
 import psycopg2
 import psycopg2.extras
+from psycopg2.pool import ThreadedConnectionPool
 from fastapi import FastAPI, Header, HTTPException, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -74,10 +75,22 @@ app.add_middleware(
 # Работа с базой данных (Postgres через psycopg2)
 # ---------------------------------------------------------------------------
 
+# Пул соединений: держим несколько живых подключений к Neon вместо того, чтобы
+# открывать новое TCP/TLS-соединение на каждый запрос — так быстрее, особенно
+# когда карусель новостей разом запрашивает список + 5 фото (6 запросов подряд).
+db_pool = ThreadedConnectionPool(
+    1, 10, DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor
+)
+
+
 def get_db() -> psycopg2.extensions.connection:
-    """Открывает соединение с базой Neon. cursor_factory даёт строки как словари."""
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
-    return conn
+    """Берёт соединение с базой Neon из пула."""
+    return db_pool.getconn()
+
+
+def release_db(conn: psycopg2.extensions.connection) -> None:
+    """Возвращает соединение обратно в пул (не закрывает его)."""
+    db_pool.putconn(conn)
 
 
 def init_db() -> None:
@@ -114,7 +127,7 @@ def init_db() -> None:
         )
         conn.commit()
     finally:
-        conn.close()
+        release_db(conn)
 
 
 init_db()  # выполняется один раз при старте сервера
@@ -170,7 +183,7 @@ def create_callback(data: CallbackRequest):
         )
         conn.commit()
     finally:
-        conn.close()
+        release_db(conn)
     return {"ok": True, "message": "Заявку прийнято"}
 
 
@@ -194,7 +207,7 @@ def list_requests(x_admin_key: str = Header(default="")):
         cur.execute("SELECT * FROM callback_requests ORDER BY id DESC")
         rows = cur.fetchall()
     finally:
-        conn.close()
+        release_db(conn)
     return [dict(row) for row in rows]
 
 
@@ -216,7 +229,7 @@ def update_status(
         conn.commit()
         affected = cur.rowcount
     finally:
-        conn.close()
+        release_db(conn)
     if affected == 0:
         raise HTTPException(status_code=404, detail="Заявку не знайдено")
     return {"ok": True}
@@ -262,7 +275,7 @@ def list_news():
         )
         rows = cur.fetchall()
     finally:
-        conn.close()
+        release_db(conn)
     return [
         {
             "id": row["id"],
@@ -283,7 +296,7 @@ def get_news_image(news_id: int):
         cur.execute("SELECT image_data, image_mime FROM news WHERE id = %s", (news_id,))
         row = cur.fetchone()
     finally:
-        conn.close()
+        release_db(conn)
     if not row:
         raise HTTPException(status_code=404, detail="Новину не знайдено")
     return Response(
@@ -324,7 +337,7 @@ def create_news(
         _prune_news(cur)
         conn.commit()
     finally:
-        conn.close()
+        release_db(conn)
     return {
         "id": created["id"],
         "text": text,
@@ -344,7 +357,7 @@ def delete_news(news_id: int, x_admin_key: str = Header(default="")):
         conn.commit()
         affected = cur.rowcount
     finally:
-        conn.close()
+        release_db(conn)
     if affected == 0:
         raise HTTPException(status_code=404, detail="Новину не знайдено")
     return {"ok": True}
