@@ -366,9 +366,11 @@ def sync_google_posts() -> dict:
         posts = _http_json(url, headers={"Authorization": f"Bearer {token}"}).get("localPosts", [])
 
         candidates = []
+        live_count = 0
         for post in posts:
             if post.get("state") != "LIVE" or not post.get("name") or not post.get("createTime"):
                 continue
+            live_count += 1
             summary = (post.get("summary") or "").strip()
             media = next(
                 (m for m in post.get("media", []) if m.get("mediaFormat", "PHOTO") == "PHOTO"
@@ -387,9 +389,11 @@ def sync_google_posts() -> dict:
                 "url": post.get("searchUrl") or "",
             })
         candidates.sort(key=lambda c: c["created_at"], reverse=True)
+        eligible_count = len(candidates)
         candidates = candidates[:NEWS_LIMIT]
 
         added = 0
+        skipped = 0
         conn = get_db()
         try:
             cur = conn.cursor()
@@ -403,9 +407,11 @@ def sync_google_posts() -> dict:
 
             for c in candidates:
                 if c["external_id"] in known:
+                    skipped += 1  # вже на сайті або прихований вами
                     continue
                 if oldest_kept and c["created_at"] <= oldest_kept:
-                    continue  # старіший за ті, що вже показуються, — не потрібен
+                    skipped += 1  # старіший за ті, що вже показуються, — не потрібен
+                    continue
                 try:
                     image_data, image_mime = _compress_image(_download(c["image"]))
                 except Exception as exc:  # одне погане фото не має ламати решту
@@ -425,7 +431,13 @@ def sync_google_posts() -> dict:
         finally:
             release_db(conn)
 
-        _last_sync_result = {"ok": True, "message": f"Синхронізовано, нових постів: {added}", "added": added}
+        message = (
+            f"Google повернув постів: {len(posts)}; активних: {live_count}; "
+            f"з фото і текстом: {eligible_count}; додано нових: {added}"
+        )
+        if skipped:
+            message += f"; пропущено (вже на сайті, приховані або старіші): {skipped}"
+        _last_sync_result = {"ok": True, "message": message, "added": added}
     except Exception as exc:
         print(f"[gbp-sync] помилка: {exc}")
         _last_sync_result = {"ok": False, "message": f"Помилка синхронізації: {exc}", "added": 0}
@@ -446,6 +458,21 @@ def sync_news_now(x_admin_key: str = Header(default="")):
     """Синхронізувати пости з Google зараз (кнопка в адмінці). Показує результат або причину помилки."""
     check_admin_key(x_admin_key)
     return sync_google_posts()
+
+
+@app.post("/api/news/unhide")
+def unhide_news(x_admin_key: str = Header(default="")):
+    """Повернути в обробку всі приховані раніше пости Google (наступна синхронізація додасть їх знову)."""
+    check_admin_key(x_admin_key)
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM news_ignored")
+        count = cur.rowcount
+        conn.commit()
+    finally:
+        release_db(conn)
+    return {"ok": True, "message": f"Прихованих постів повернуто: {count}. Натисніть «Синхронізувати з Google зараз»."}
 
 
 @app.get("/api/news")
