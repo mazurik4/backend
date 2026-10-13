@@ -24,13 +24,14 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import psycopg2
 import psycopg2.extras
 from psycopg2.pool import ThreadedConnectionPool
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from PIL import Image
@@ -149,6 +150,21 @@ def init_db() -> None:
         )
         # Пости Google, які власник видалив з сайту вручну — щоб синхронізація їх не повертала.
         cur.execute("CREATE TABLE IF NOT EXISTS news_ignored (external_id TEXT PRIMARY KEY)")
+        # Анонімна статистика сайту: без IP, cookie та будь-яких ідентифікаторів людини.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                ref TEXT NOT NULL DEFAULT '',
+                device TEXT NOT NULL DEFAULT '',
+                new_session BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS events_created_idx ON events (created_at)")
         conn.commit()
     finally:
         release_db(conn)
@@ -547,6 +563,156 @@ def delete_news(news_id: int, x_admin_key: str = Header(default="")):
     if affected == 0:
         raise HTTPException(status_code=404, detail="Новину не знайдено")
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Анонімна статистика сайту: перегляди, натискання кнопок, звідки прийшли.
+# Не зберігаємо IP, cookie, ім'я чи телефон — лише назву події, короткий підпис,
+# сайт-джерело (домен), тип пристрою і час. Зберігаємо EVENTS_KEEP_DAYS днів.
+# ---------------------------------------------------------------------------
+
+EVENT_NAMES = {
+    "view",          # перегляд сторінки
+    "call_click",    # натискання «Подзвонити» (label — де саме)
+    "tg_click",      # натискання Telegram
+    "route_click",   # «Побудувати маршрут»
+    "form_submit",   # надіслана форма «Замовити дзвінок» (label — симптом)
+    "symptom_pick",  # вибір симптому в «Підбір за симптомом»
+    "service_open",  # розгорнута послуга
+    "faq_open",      # відкрите питання FAQ
+    "news_click",    # клік по новині
+    "nav_click",     # клік по меню
+}
+EVENT_DEVICES = {"mobile", "desktop"}
+EVENTS_KEEP_DAYS = 365
+EVENTS_PER_MINUTE = 120  # ліміт на одну IP-адресу (щоб не засмічували статистику)
+
+_event_hits = defaultdict(deque)
+_event_lock = threading.Lock()
+
+
+def _event_rate_ok(ip: str) -> bool:
+    """Простий ліміт частоти за IP; сама IP в базу не потрапляє."""
+    now = time.time()
+    with _event_lock:
+        hits = _event_hits[ip]
+        while hits and now - hits[0] > 60:
+            hits.popleft()
+        if len(hits) >= EVENTS_PER_MINUTE:
+            return False
+        hits.append(now)
+        if len(_event_hits) > 5000:  # не даємо словнику рости безкінечно
+            _event_hits.clear()
+        return True
+
+
+class EventIn(BaseModel):
+    name: str
+    label: str = ""
+    ref: str = ""
+    device: str = ""
+    new_session: bool = False
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
+
+
+@app.post("/api/event")
+def track_event(data: EventIn, request: Request):
+    """Приймає подію зі сторінки сайту. Невідомі події тихо ігноруються."""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    ip = forwarded.split(",")[0].strip() or (request.client.host if request.client else "?")
+    if data.name not in EVENT_NAMES or not _event_rate_ok(ip):
+        return {"ok": False}
+    device = data.device if data.device in EVENT_DEVICES else ""
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO events (name, label, ref, device, new_session, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+            """,
+            (data.name, data.label.strip()[:60], data.ref.strip().lower()[:60], device, data.new_session, _utc_now_iso()),
+        )
+        # зрідка (кожен 200-й запис) чистимо записи старші за EVENTS_KEEP_DAYS
+        if cur.fetchone()["id"] % 200 == 0:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=EVENTS_KEEP_DAYS)).replace(tzinfo=None)
+            cur.execute("DELETE FROM events WHERE created_at < %s", (cutoff.isoformat(timespec="seconds"),))
+        conn.commit()
+    finally:
+        release_db(conn)
+    return {"ok": True}
+
+
+@app.get("/api/stats")
+def get_stats(days: int = 30, x_admin_key: str = Header(default="")):
+    """Зведена статистика за останні N днів (7–365). Лише для адміна."""
+    check_admin_key(x_admin_key)
+    days = max(1, min(days, 365))
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).replace(tzinfo=None).isoformat(timespec="seconds")
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*) FILTER (WHERE name = 'view') AS views,
+                   COUNT(*) FILTER (WHERE name = 'view' AND new_session) AS sessions
+            FROM events WHERE created_at >= %s
+            """,
+            (cutoff,),
+        )
+        totals = dict(cur.fetchone())
+        cur.execute(
+            """
+            SELECT substr(created_at, 1, 10) AS dt,
+                   COUNT(*) FILTER (WHERE name = 'view') AS views,
+                   COUNT(*) FILTER (WHERE name = 'view' AND new_session) AS sessions
+            FROM events WHERE created_at >= %s GROUP BY dt ORDER BY dt
+            """,
+            (cutoff,),
+        )
+        daily = [{"day": r["dt"], "views": r["views"], "sessions": r["sessions"]} for r in cur.fetchall()]
+        cur.execute(
+            """
+            SELECT name, label, COUNT(*) AS n FROM events
+            WHERE created_at >= %s AND name <> 'view'
+            GROUP BY name, label ORDER BY n DESC
+            """,
+            (cutoff,),
+        )
+        grouped = defaultdict(list)
+        for r in cur.fetchall():
+            grouped[r["name"]].append({"label": r["label"], "count": r["n"]})
+        cur.execute(
+            """
+            SELECT CASE WHEN ref = '' THEN 'прямий захід / невідомо' ELSE ref END AS source, COUNT(*) AS n
+            FROM events WHERE created_at >= %s AND name = 'view' AND new_session
+            GROUP BY source ORDER BY n DESC LIMIT 10
+            """,
+            (cutoff,),
+        )
+        sources = [{"label": r["source"], "count": r["n"]} for r in cur.fetchall()]
+        cur.execute(
+            """
+            SELECT CASE WHEN device = '' THEN 'невідомо' ELSE device END AS dev, COUNT(*) AS n
+            FROM events WHERE created_at >= %s AND name = 'view' AND new_session
+            GROUP BY dev ORDER BY n DESC
+            """,
+            (cutoff,),
+        )
+        devices = [{"label": r["dev"], "count": r["n"]} for r in cur.fetchall()]
+    finally:
+        release_db(conn)
+    return {
+        "days": days,
+        "totals": totals,
+        "daily": daily,
+        "events": {name: items[:15] for name, items in grouped.items()},
+        "sources": sources,
+        "devices": devices,
+    }
 
 
 # ---------------------------------------------------------------------------
