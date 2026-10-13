@@ -17,15 +17,20 @@
 """
 
 import io
+import json
 import os
 import re
-from datetime import datetime
+import threading
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 import psycopg2
 import psycopg2.extras
 from psycopg2.pool import ThreadedConnectionPool
-from fastapi import FastAPI, Header, HTTPException, Form, UploadFile, File
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from PIL import Image
@@ -56,6 +61,15 @@ ADMIN_KEY = os.environ.get("ADMIN_KEY", "change-me-locally-for-dev")
 NEWS_LIMIT = 5
 NEWS_MAX_TEXT_LEN = 300
 NEWS_IMAGE_MAX_WIDTH = 1200
+
+# Автосинхронізація постів з Google Business Profile. Вмикається, лише якщо задані
+# ВСІ п'ять змінних оточення (на Render: Environment). Без них нові новини не з'являються.
+GBP_CLIENT_ID = os.environ.get("GBP_CLIENT_ID", "")
+GBP_CLIENT_SECRET = os.environ.get("GBP_CLIENT_SECRET", "")
+GBP_REFRESH_TOKEN = os.environ.get("GBP_REFRESH_TOKEN", "")
+GBP_ACCOUNT_ID = os.environ.get("GBP_ACCOUNT_ID", "")    # лише цифри з accounts/<ID>
+GBP_LOCATION_ID = os.environ.get("GBP_LOCATION_ID", "")  # лише цифри з locations/<ID>
+GBP_SYNC_INTERVAL_SEC = 30 * 60  # не частіше ніж раз на 30 хвилин при відвідуваннях сайту
 
 app = FastAPI(title="Автодіагностика — бекенд")
 
@@ -125,6 +139,16 @@ def init_db() -> None:
             )
             """
         )
+        # Звідки новина: 'manual' (адмінка) або 'google' (автосинхронізація),
+        # унікальний ID поста Google (щоб не дублювати) і пряме посилання на пост.
+        cur.execute("ALTER TABLE news ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual'")
+        cur.execute("ALTER TABLE news ADD COLUMN IF NOT EXISTS external_id TEXT")
+        cur.execute("ALTER TABLE news ADD COLUMN IF NOT EXISTS post_url TEXT NOT NULL DEFAULT ''")
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS news_external_id_uq ON news (external_id) WHERE external_id IS NOT NULL"
+        )
+        # Пости Google, які власник видалив з сайту вручну — щоб синхронізація їх не повертала.
+        cur.execute("CREATE TABLE IF NOT EXISTS news_ignored (external_id TEXT PRIMARY KEY)")
         conn.commit()
     finally:
         release_db(conn)
@@ -237,7 +261,8 @@ def update_status(
 
 # ---------------------------------------------------------------------------
 # Новини (карусель на сайті) — фото + короткий текст, останні NEWS_LIMIT штук.
-# Джерело зараз — ручне додавання власником через static/admin.html.
+# Джерело — пости Google Business Profile (автосинхронізація). Ручного додавання немає;
+# у static/admin.html можна лише запустити синхронізацію або сховати зайвий пост.
 # ---------------------------------------------------------------------------
 
 def _compress_image(raw: bytes):
@@ -256,21 +281,178 @@ def _compress_image(raw: bytes):
 
 
 def _prune_news(cur) -> None:
-    """Оставляет только NEWS_LIMIT самых новых новостей."""
+    """Оставляет только NEWS_LIMIT самых новых новостей (за датою, а не за id)."""
     cur.execute(
-        "DELETE FROM news WHERE id NOT IN (SELECT id FROM news ORDER BY id DESC LIMIT %s)",
+        """
+        DELETE FROM news WHERE id NOT IN (
+            SELECT id FROM news ORDER BY created_at DESC, id DESC LIMIT %s
+        )
+        """,
         (NEWS_LIMIT,),
     )
+
+
+# ---------------------------------------------------------------------------
+# Автосинхронізація з Google Business Profile (пости -> карусель новин)
+# ---------------------------------------------------------------------------
+
+def gbp_configured() -> bool:
+    return all([GBP_CLIENT_ID, GBP_CLIENT_SECRET, GBP_REFRESH_TOKEN, GBP_ACCOUNT_ID, GBP_LOCATION_ID])
+
+
+def _http_json(url: str, data: dict = None, headers: dict = None) -> dict:
+    """Маленький HTTP-клієнт без додаткових бібліотек. data != None -> POST форма."""
+    body = urllib.parse.urlencode(data).encode() if data is not None else None
+    req = urllib.request.Request(url, data=body, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _gbp_access_token() -> str:
+    """Міняє довгостроковий refresh token на короткий access token (діє ~1 годину)."""
+    result = _http_json(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": GBP_CLIENT_ID,
+            "client_secret": GBP_CLIENT_SECRET,
+            "refresh_token": GBP_REFRESH_TOKEN,
+            "grant_type": "refresh_token",
+        },
+    )
+    return result["access_token"]
+
+
+def _gbp_iso_to_naive_utc(value: str) -> str:
+    """'2026-10-01T12:34:56.789Z' -> '2026-10-01T12:34:56' (так само, як created_at ручних новин)."""
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return dt.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
+
+
+def _download(url: str) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "autoworkshop-news-sync"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.read(10 * 1024 * 1024)  # не більше 10 МБ
+
+
+_sync_lock = threading.Lock()
+_last_sync_at = 0.0
+_last_sync_result = {"ok": None, "message": "Синхронізація ще не запускалась", "added": 0}
+
+
+def sync_google_posts() -> dict:
+    """
+    Тягне останні пости з Google Business Profile й додає нові в таблицю news.
+    Пости без фото пропускаються (карусель показує фото + текст).
+    Повертає {"ok", "message", "added"}; помилки не кидає, а повертає текстом.
+    """
+    global _last_sync_at, _last_sync_result
+    if not gbp_configured():
+        return {"ok": False, "message": "Google-синхронізація не налаштована (немає змінних GBP_*)", "added": 0}
+    if not _sync_lock.acquire(blocking=False):
+        return {"ok": True, "message": "Синхронізація вже виконується", "added": 0}
+    try:
+        token = _gbp_access_token()
+        url = (
+            f"https://mybusiness.googleapis.com/v4/accounts/{GBP_ACCOUNT_ID}"
+            f"/locations/{GBP_LOCATION_ID}/localPosts?pageSize=20"
+        )
+        posts = _http_json(url, headers={"Authorization": f"Bearer {token}"}).get("localPosts", [])
+
+        candidates = []
+        for post in posts:
+            if post.get("state") != "LIVE" or not post.get("name") or not post.get("createTime"):
+                continue
+            summary = (post.get("summary") or "").strip()
+            media = next(
+                (m for m in post.get("media", []) if m.get("mediaFormat", "PHOTO") == "PHOTO"
+                 and (m.get("googleUrl") or m.get("sourceUrl"))),
+                None,
+            )
+            if not summary or not media:
+                continue
+            if len(summary) > NEWS_MAX_TEXT_LEN:
+                summary = summary[: NEWS_MAX_TEXT_LEN - 1].rstrip() + "…"
+            candidates.append({
+                "external_id": post["name"],
+                "text": summary,
+                "created_at": _gbp_iso_to_naive_utc(post["createTime"]),
+                "image": media.get("googleUrl") or media.get("sourceUrl"),
+                "url": post.get("searchUrl") or "",
+            })
+        candidates.sort(key=lambda c: c["created_at"], reverse=True)
+        candidates = candidates[:NEWS_LIMIT]
+
+        added = 0
+        conn = get_db()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT external_id FROM news WHERE external_id IS NOT NULL")
+            known = {r["external_id"] for r in cur.fetchall()}
+            cur.execute("SELECT external_id FROM news_ignored")
+            known |= {r["external_id"] for r in cur.fetchall()}
+            cur.execute("SELECT created_at FROM news ORDER BY created_at DESC, id DESC LIMIT %s", (NEWS_LIMIT,))
+            kept = [r["created_at"] for r in cur.fetchall()]
+            oldest_kept = kept[-1] if len(kept) >= NEWS_LIMIT else None
+
+            for c in candidates:
+                if c["external_id"] in known:
+                    continue
+                if oldest_kept and c["created_at"] <= oldest_kept:
+                    continue  # старіший за ті, що вже показуються, — не потрібен
+                try:
+                    image_data, image_mime = _compress_image(_download(c["image"]))
+                except Exception as exc:  # одне погане фото не має ламати решту
+                    print(f"[gbp-sync] пропускаю {c['external_id']}: фото не завантажилось ({exc})")
+                    continue
+                cur.execute(
+                    """
+                    INSERT INTO news (text, image_data, image_mime, created_at, source, external_id, post_url)
+                    VALUES (%s, %s, %s, %s, 'google', %s, %s)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (c["text"], psycopg2.Binary(image_data), image_mime, c["created_at"], c["external_id"], c["url"]),
+                )
+                added += cur.rowcount
+            _prune_news(cur)
+            conn.commit()
+        finally:
+            release_db(conn)
+
+        _last_sync_result = {"ok": True, "message": f"Синхронізовано, нових постів: {added}", "added": added}
+    except Exception as exc:
+        print(f"[gbp-sync] помилка: {exc}")
+        _last_sync_result = {"ok": False, "message": f"Помилка синхронізації: {exc}", "added": 0}
+    finally:
+        _last_sync_at = time.time()
+        _sync_lock.release()
+    return _last_sync_result
+
+
+def _maybe_sync_in_background() -> None:
+    """Якщо автосинхронізація налаштована і давно не запускалась — запускає її у фоні."""
+    if gbp_configured() and time.time() - _last_sync_at > GBP_SYNC_INTERVAL_SEC:
+        threading.Thread(target=sync_google_posts, daemon=True).start()
+
+
+@app.post("/api/news/sync")
+def sync_news_now(x_admin_key: str = Header(default="")):
+    """Синхронізувати пости з Google зараз (кнопка в адмінці). Показує результат або причину помилки."""
+    check_admin_key(x_admin_key)
+    return sync_google_posts()
 
 
 @app.get("/api/news")
 def list_news():
     """Останні новини для каруселі на сайті. Доступно всім, без ключа."""
+    _maybe_sync_in_background()
     conn = get_db()
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, text, created_at FROM news ORDER BY id DESC LIMIT %s",
+            """
+            SELECT id, text, created_at, source, post_url FROM news
+            ORDER BY created_at DESC, id DESC LIMIT %s
+            """,
             (NEWS_LIMIT,),
         )
         rows = cur.fetchall()
@@ -282,6 +464,8 @@ def list_news():
             "text": row["text"],
             "created_at": row["created_at"],
             "image_url": f"/api/news/{row['id']}/image",
+            "source": row["source"],
+            "url": row["post_url"],
         }
         for row in rows
     ]
@@ -306,46 +490,6 @@ def get_news_image(news_id: int):
     )
 
 
-@app.post("/api/news")
-def create_news(
-    text: str = Form(...),
-    image: UploadFile = File(...),
-    x_admin_key: str = Header(default=""),
-):
-    """Додати новину (для адмінки). Найстаріша зайва — видаляється автоматично."""
-    check_admin_key(x_admin_key)
-    text = text.strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Текст новини порожній")
-    if len(text) > NEWS_MAX_TEXT_LEN:
-        raise HTTPException(status_code=400, detail=f"Текст довший за {NEWS_MAX_TEXT_LEN} символів")
-
-    image_data, image_mime = _compress_image(image.file.read())
-
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO news (text, image_data, image_mime, created_at)
-            VALUES (%s, %s, %s, %s)
-            RETURNING id, created_at
-            """,
-            (text, psycopg2.Binary(image_data), image_mime, datetime.now().isoformat(timespec="seconds")),
-        )
-        created = cur.fetchone()
-        _prune_news(cur)
-        conn.commit()
-    finally:
-        release_db(conn)
-    return {
-        "id": created["id"],
-        "text": text,
-        "created_at": created["created_at"],
-        "image_url": f"/api/news/{created['id']}/image",
-    }
-
-
 @app.delete("/api/news/{news_id}")
 def delete_news(news_id: int, x_admin_key: str = Header(default="")):
     """Видалити новину (виправити помилку публікації)."""
@@ -353,6 +497,14 @@ def delete_news(news_id: int, x_admin_key: str = Header(default="")):
     conn = get_db()
     try:
         cur = conn.cursor()
+        # Якщо це пост з Google — запам'ятовуємо, щоб синхронізація не повернула його назад.
+        cur.execute("SELECT external_id FROM news WHERE id = %s", (news_id,))
+        row = cur.fetchone()
+        if row and row["external_id"]:
+            cur.execute(
+                "INSERT INTO news_ignored (external_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                (row["external_id"],),
+            )
         cur.execute("DELETE FROM news WHERE id = %s", (news_id,))
         conn.commit()
         affected = cur.rowcount
