@@ -217,6 +217,13 @@ def check_admin_key(x_admin_key: str) -> None:
         raise HTTPException(status_code=401, detail="Невірний ключ доступу")
 
 
+@app.get("/api/admin/check")
+def admin_check(x_admin_key: str = Header(default="")):
+    """Перевірка ключа для екрана входу в адмінку: 200 — ключ вірний, 401 — ні."""
+    check_admin_key(x_admin_key)
+    return {"ok": True}
+
+
 @app.get("/api/requests")
 def list_requests(x_admin_key: str = Header(default="")):
     """
