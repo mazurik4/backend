@@ -183,6 +183,10 @@ def init_db() -> None:
             """
         )
         cur.execute("CREATE INDEX IF NOT EXISTS gallery_created_idx ON gallery (created_at)")
+        # Свій розділ, який власник призначає фото в адмінці (порожньо = назва за категорією Google),
+        # і список прихованих фото, щоб синхронізація не повертала їх.
+        cur.execute("ALTER TABLE gallery ADD COLUMN IF NOT EXISTS section TEXT NOT NULL DEFAULT ''")
+        cur.execute("CREATE TABLE IF NOT EXISTS gallery_ignored (external_id TEXT PRIMARY KEY)")
         conn.commit()
     finally:
         release_db(conn)
@@ -684,6 +688,8 @@ def sync_google_gallery(max_new: int = None) -> dict:
             cur = conn.cursor()
             cur.execute("SELECT external_id FROM gallery")
             known = {r["external_id"] for r in cur.fetchall()}
+            cur.execute("SELECT external_id FROM gallery_ignored")
+            known |= {r["external_id"] for r in cur.fetchall()}  # приховані власником — не повертаємо
             for u in usable:
                 if u["external_id"] in known:
                     continue
@@ -756,6 +762,72 @@ def sync_gallery_now(x_admin_key: str = Header(default="")):
     return sync_google_gallery(max_new=GALLERY_BATCH)
 
 
+GALLERY_SECTION_MAX_LEN = 40
+GALLERY_DEFAULT_SECTION = "Інше"
+
+
+class GalleryIds(BaseModel):
+    ids: list[int]
+
+
+class GalleryAssign(BaseModel):
+    ids: list[int]
+    section: str = ""  # порожньо = повернути назву за категорією Google
+
+
+@app.post("/api/gallery/assign")
+def gallery_assign(data: GalleryAssign, x_admin_key: str = Header(default="")):
+    """Призначити вибраним фото розділ (нові розділи створюються просто назвою)."""
+    check_admin_key(x_admin_key)
+    section = re.sub(r"\s+", " ", data.section).strip()[:GALLERY_SECTION_MAX_LEN]
+    if not data.ids:
+        raise HTTPException(status_code=400, detail="Не вибрано жодного фото")
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE gallery SET section = %s WHERE id = ANY(%s)", (section, data.ids))
+        changed = cur.rowcount
+        conn.commit()
+    finally:
+        release_db(conn)
+    return {"ok": True, "message": f"Розділ «{section or 'за замовчуванням'}» призначено фото: {changed}"}
+
+
+@app.post("/api/gallery/hide")
+def gallery_hide(data: GalleryIds, x_admin_key: str = Header(default="")):
+    """Сховати вибрані фото з сайту (синхронізація їх не поверне, поки не натиснуто «Показати приховані»)."""
+    check_admin_key(x_admin_key)
+    if not data.ids:
+        raise HTTPException(status_code=400, detail="Не вибрано жодного фото")
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT external_id FROM gallery WHERE id = ANY(%s)", (data.ids,))
+        for r in cur.fetchall():
+            cur.execute("INSERT INTO gallery_ignored (external_id) VALUES (%s) ON CONFLICT DO NOTHING", (r["external_id"],))
+        cur.execute("DELETE FROM gallery WHERE id = ANY(%s)", (data.ids,))
+        hidden = cur.rowcount
+        conn.commit()
+    finally:
+        release_db(conn)
+    return {"ok": True, "message": f"Сховано фото: {hidden}"}
+
+
+@app.post("/api/gallery/unhide")
+def gallery_unhide(x_admin_key: str = Header(default="")):
+    """Повернути всі приховані фото в обробку (наступна синхронізація додасть їх знову)."""
+    check_admin_key(x_admin_key)
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM gallery_ignored")
+        count = cur.rowcount
+        conn.commit()
+    finally:
+        release_db(conn)
+    return {"ok": True, "message": f"Прихованих фото повернуто: {count}. Натисніть «Синхронізувати галерею…»."}
+
+
 @app.get("/api/gallery")
 def list_gallery():
     """Список медіа для сторінки «Наша галерея». Публічний."""
@@ -764,40 +836,42 @@ def list_gallery():
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, category, media_type, width, height, created_at FROM gallery ORDER BY created_at DESC, id DESC"
+            "SELECT id, category, section, media_type, width, height, created_at FROM gallery ORDER BY created_at DESC, id DESC"
         )
         rows = cur.fetchall()
     finally:
         release_db(conn)
-    items = [
-        {
+    items = []
+    for r in rows:
+        # назва розділу: призначена власником або за категорією Google
+        title = (r["section"] or "").strip() or GALLERY_CATEGORY_TITLES.get(r["category"], GALLERY_DEFAULT_SECTION)
+        items.append({
             "id": r["id"],
-            "category": r["category"],
+            "category": title,  # ключ розділу = його назва
             "type": r["media_type"],
             "width": r["width"],
             "height": r["height"],
             "created_at": r["created_at"],
             "image_url": f"/api/gallery/{r['id']}/image",
             "thumb_url": f"/api/gallery/{r['id']}/thumb",
-        }
-        for r in rows
-    ]
+        })
     counts = defaultdict(int)
-    for it in items:
+    newest = {}
+    for it in items:  # items уже від нових до старих
         if it["type"] == "PHOTO":
             counts[it["category"]] += 1
-    categories = [
-        {"key": key, "title": title, "count": counts[key]}
-        for key, title in GALLERY_CATEGORIES
-        if counts[key]
-    ]
+            newest.setdefault(it["category"], it["created_at"])
+    # розділи: спочатку ті, де найновіші фото; «Інше» завжди в кінці
+    order = sorted(counts, key=lambda t: newest[t], reverse=True)
+    order.sort(key=lambda t: t == GALLERY_DEFAULT_SECTION)
+    categories = [{"key": t, "title": t, "count": counts[t]} for t in order]
     return {
         "items": items,
         "categories": categories,
         "photos": sum(1 for it in items if it["type"] == "PHOTO"),
         "videos": sum(1 for it in items if it["type"] == "VIDEO"),
         "profile_url": GBP_PROFILE_URL,
-        "titles": GALLERY_CATEGORY_TITLES,
+        "titles": {it["category"]: it["category"] for it in items},
     }
 
 
