@@ -165,6 +165,24 @@ def init_db() -> None:
             """
         )
         cur.execute("CREATE INDEX IF NOT EXISTS events_created_idx ON events (created_at)")
+        # Галерея: фото і превʼю відео з розділу «Фото і відео» Google-профілю (копії у нашій базі,
+        # бо посилання Google на медіа нестабільні й можуть змінюватись).
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gallery (
+                id SERIAL PRIMARY KEY,
+                external_id TEXT NOT NULL UNIQUE,
+                category TEXT NOT NULL DEFAULT 'ADDITIONAL',
+                media_type TEXT NOT NULL DEFAULT 'PHOTO',
+                width INTEGER NOT NULL DEFAULT 0,
+                height INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                image_data BYTEA NOT NULL,
+                thumb_data BYTEA NOT NULL
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS gallery_created_idx ON gallery (created_at)")
         conn.commit()
     finally:
         release_db(conn)
@@ -288,18 +306,18 @@ def update_status(
 # у static/admin.html можна лише запустити синхронізацію або сховати зайвий пост.
 # ---------------------------------------------------------------------------
 
-def _compress_image(raw: bytes):
+def _compress_image(raw: bytes, max_width: int = NEWS_IMAGE_MAX_WIDTH, quality: int = 82):
     """Ужимает фото до разумного размера и перекодирует в JPEG."""
     try:
         image = Image.open(io.BytesIO(raw))
         image = image.convert("RGB")
     except Exception:
         raise HTTPException(status_code=400, detail="Файл не є зображенням")
-    if image.width > NEWS_IMAGE_MAX_WIDTH:
-        ratio = NEWS_IMAGE_MAX_WIDTH / image.width
-        image = image.resize((NEWS_IMAGE_MAX_WIDTH, int(image.height * ratio)))
+    if image.width > max_width:
+        ratio = max_width / image.width
+        image = image.resize((max_width, int(image.height * ratio)))
     buffer = io.BytesIO()
-    image.save(buffer, format="JPEG", quality=82)
+    image.save(buffer, format="JPEG", quality=quality)
     return buffer.getvalue(), "image/jpeg"
 
 
@@ -566,6 +584,251 @@ def delete_news(news_id: int, x_admin_key: str = Header(default="")):
 
 
 # ---------------------------------------------------------------------------
+# Галерея «Наша галерея»: фото та превʼю відео з розділу «Фото і відео» Google-профілю.
+# Беремо лише медіа власника (media.list), без обкладинки/логотипу. Відео API віддає
+# як картинку-превʼю, тому на сайті воно веде на Google-профіль.
+# ---------------------------------------------------------------------------
+
+GALLERY_LIMIT = 120          # скільки найновіших медіа тримаємо на сайті
+GALLERY_BATCH = 15           # скільки нових медіа завантажуємо за один ручний запуск (щоб не впертись у таймаут)
+GALLERY_IMAGE_WIDTH = 1400   # велике фото для перегляду
+GALLERY_THUMB_WIDTH = 640    # превʼю в сітці
+GALLERY_SKIP_CATEGORIES = {"COVER", "PROFILE", "LOGO"}
+GBP_PROFILE_URL = "https://www.google.com/maps?cid=15792600053340114773"
+
+# (ключ Google, назва на сайті) — у такому порядку показуємо розділи
+GALLERY_CATEGORIES = [
+    ("AT_WORK", "У роботі"),
+    ("PRODUCT", "Обладнання та запчастини"),
+    ("INTERIOR", "Майстерня всередині"),
+    ("EXTERIOR", "Зовні"),
+    ("TEAMS", "Команда"),
+    ("COMMON_AREA", "Приміщення"),
+    ("ADDITIONAL", "Інше"),
+]
+GALLERY_CATEGORY_TITLES = dict(GALLERY_CATEGORIES)
+
+_gallery_lock = threading.Lock()
+_gallery_last_sync_at = 0.0
+
+
+def _gbp_sized(url: str, width: int) -> str:
+    """Просить у googleusercontent потрібну ширину (=w1400). Інші адреси лишає як є."""
+    if "googleusercontent.com" in url or "ggpht.com" in url:
+        return url.split("=")[0] + f"={'w' + str(width)}"
+    return url
+
+
+def _image_size(data: bytes):
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            return im.width, im.height
+    except Exception:
+        return 0, 0
+
+
+def sync_google_gallery(max_new: int = None) -> dict:
+    """
+    Тягне медіа власника з Google, додає нові в таблицю gallery (копії фото + превʼю)
+    і прибирає те, чого вже немає в Google. max_new обмежує кількість завантажень за запуск.
+    Повертає {"ok", "message", "added", "remaining"}; помилки не кидає, а повертає текстом.
+    """
+    global _gallery_last_sync_at
+    if not gbp_configured():
+        return {"ok": False, "message": "Google-синхронізація не налаштована (немає змінних GBP_*)", "added": 0, "remaining": 0}
+    if not _gallery_lock.acquire(blocking=False):
+        return {"ok": True, "message": "Синхронізація галереї вже виконується", "added": 0, "remaining": 0}
+    try:
+        token = _gbp_access_token()
+        auth = {"Authorization": f"Bearer {token}"}
+        media = []
+        page_token = ""
+        while len(media) < 1000:
+            url = (
+                f"https://mybusiness.googleapis.com/v4/accounts/{GBP_ACCOUNT_ID}"
+                f"/locations/{GBP_LOCATION_ID}/media?pageSize=200"
+            )
+            if page_token:
+                url += "&pageToken=" + urllib.parse.quote(page_token)
+            data = _http_json(url, headers=auth)
+            media += data.get("mediaItems", [])
+            page_token = data.get("nextPageToken", "")
+            if not page_token:
+                break
+
+        usable = []
+        by_category = defaultdict(int)
+        for m in media:
+            category = (m.get("locationAssociation") or {}).get("category") or "ADDITIONAL"
+            fmt = m.get("mediaFormat", "PHOTO")
+            link = m.get("googleUrl") or m.get("thumbnailUrl")
+            if category in GALLERY_SKIP_CATEGORIES or fmt not in ("PHOTO", "VIDEO"):
+                continue
+            if not m.get("name") or not link or not m.get("createTime"):
+                continue
+            by_category[category] += 1
+            usable.append({
+                "external_id": m["name"],
+                "category": category if category in GALLERY_CATEGORY_TITLES else "ADDITIONAL",
+                "media_type": fmt,
+                "created_at": _gbp_iso_to_naive_utc(m["createTime"]),
+                "link": link,
+            })
+        usable.sort(key=lambda u: u["created_at"], reverse=True)
+        usable = usable[:GALLERY_LIMIT]
+
+        added = 0
+        remaining = 0
+        conn = get_db()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT external_id FROM gallery")
+            known = {r["external_id"] for r in cur.fetchall()}
+            for u in usable:
+                if u["external_id"] in known:
+                    continue
+                if max_new is not None and added >= max_new:
+                    remaining += 1
+                    continue
+                try:
+                    try:
+                        raw = _download(_gbp_sized(u["link"], GALLERY_IMAGE_WIDTH))
+                    except Exception:
+                        raw = _download(u["link"])
+                    image_data, _ = _compress_image(raw, GALLERY_IMAGE_WIDTH, 80)
+                    thumb_data, _ = _compress_image(raw, GALLERY_THUMB_WIDTH, 76)
+                except Exception as exc:  # одне погане фото не має ламати решту
+                    print(f"[gbp-gallery] пропускаю {u['external_id']}: {exc}")
+                    continue
+                width, height = _image_size(image_data)
+                cur.execute(
+                    """
+                    INSERT INTO gallery (external_id, category, media_type, width, height, created_at, image_data, thumb_data)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (external_id) DO NOTHING
+                    """,
+                    (u["external_id"], u["category"], u["media_type"], width, height, u["created_at"],
+                     psycopg2.Binary(image_data), psycopg2.Binary(thumb_data)),
+                )
+                added += cur.rowcount
+                conn.commit()  # кожне фото окремо: при збої не втрачаємо вже завантажене
+            if usable:  # прибираємо те, що власник видалив у Google (лише якщо список не порожній)
+                cur.execute("DELETE FROM gallery WHERE external_id <> ALL(%s)", ([u["external_id"] for u in usable],))
+            conn.commit()
+            cur.execute("SELECT COUNT(*) AS n FROM gallery")
+            total = cur.fetchone()["n"]
+        finally:
+            release_db(conn)
+
+        parts = ", ".join(f"{GALLERY_CATEGORY_TITLES.get(k, k)}: {n}" for k, n in sorted(by_category.items()))
+        message = (
+            f"Google повернув медіа: {len(media)}; підходить для галереї: {len(usable)}"
+            f"{' (' + parts + ')' if parts else ''}; додано нових: {added}; на сайті: {total}"
+        )
+        if remaining:
+            message += f". Залишилось завантажити: {remaining} — натисніть кнопку ще раз"
+        return {"ok": True, "message": message, "added": added, "remaining": remaining}
+    except Exception as exc:
+        print(f"[gbp-gallery] помилка: {exc}")
+        return {"ok": False, "message": f"Помилка синхронізації галереї: {exc}", "added": 0, "remaining": 0}
+    finally:
+        _gallery_last_sync_at = time.time()
+        _gallery_lock.release()
+
+
+def _sync_gallery_fully() -> None:
+    """Фонова повна синхронізація: крутимось, поки не завантажимо все нове (без ліміту таймауту запиту)."""
+    for _ in range(20):
+        result = sync_google_gallery(max_new=GALLERY_BATCH)
+        if not result.get("ok") or not result.get("remaining"):
+            break
+
+
+def _maybe_sync_gallery_in_background() -> None:
+    if gbp_configured() and time.time() - _gallery_last_sync_at > GBP_SYNC_INTERVAL_SEC:
+        threading.Thread(target=_sync_gallery_fully, daemon=True).start()
+
+
+@app.post("/api/gallery/sync")
+def sync_gallery_now(x_admin_key: str = Header(default="")):
+    """Синхронізувати галерею з Google зараз (кнопка в адмінці). Порціями по GALLERY_BATCH нових медіа."""
+    check_admin_key(x_admin_key)
+    return sync_google_gallery(max_new=GALLERY_BATCH)
+
+
+@app.get("/api/gallery")
+def list_gallery():
+    """Список медіа для сторінки «Наша галерея». Публічний."""
+    _maybe_sync_gallery_in_background()
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, category, media_type, width, height, created_at FROM gallery ORDER BY created_at DESC, id DESC"
+        )
+        rows = cur.fetchall()
+    finally:
+        release_db(conn)
+    items = [
+        {
+            "id": r["id"],
+            "category": r["category"],
+            "type": r["media_type"],
+            "width": r["width"],
+            "height": r["height"],
+            "created_at": r["created_at"],
+            "image_url": f"/api/gallery/{r['id']}/image",
+            "thumb_url": f"/api/gallery/{r['id']}/thumb",
+        }
+        for r in rows
+    ]
+    counts = defaultdict(int)
+    for it in items:
+        if it["type"] == "PHOTO":
+            counts[it["category"]] += 1
+    categories = [
+        {"key": key, "title": title, "count": counts[key]}
+        for key, title in GALLERY_CATEGORIES
+        if counts[key]
+    ]
+    return {
+        "items": items,
+        "categories": categories,
+        "photos": sum(1 for it in items if it["type"] == "PHOTO"),
+        "videos": sum(1 for it in items if it["type"] == "VIDEO"),
+        "profile_url": GBP_PROFILE_URL,
+        "titles": GALLERY_CATEGORY_TITLES,
+    }
+
+
+def _gallery_picture(media_id: int, column: str):
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT {column} AS data FROM gallery WHERE id = %s", (media_id,))
+        row = cur.fetchone()
+    finally:
+        release_db(conn)
+    if not row:
+        raise HTTPException(status_code=404, detail="Фото не знайдено")
+    return Response(
+        content=bytes(row["data"]),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=604800, immutable"},
+    )
+
+
+@app.get("/api/gallery/{media_id}/image")
+def gallery_image(media_id: int):
+    return _gallery_picture(media_id, "image_data")
+
+
+@app.get("/api/gallery/{media_id}/thumb")
+def gallery_thumb(media_id: int):
+    return _gallery_picture(media_id, "thumb_data")
+
+
+# ---------------------------------------------------------------------------
 # Анонімна статистика сайту: перегляди, натискання кнопок, звідки прийшли.
 # Не зберігаємо IP, cookie, ім'я чи телефон — лише назву події, короткий підпис,
 # сайт-джерело (домен), тип пристрою і час. Зберігаємо EVENTS_KEEP_DAYS днів.
@@ -582,6 +845,8 @@ EVENT_NAMES = {
     "faq_open",      # відкрите питання FAQ
     "news_click",    # клік по новині
     "nav_click",     # клік по меню
+    "gallery_tab",   # перемикання розділу в галереї (label — розділ)
+    "gallery_open",  # відкрите фото в галереї (label — розділ)
 }
 EVENT_DEVICES = {"mobile", "desktop"}
 EVENTS_KEEP_DAYS = 365
@@ -703,6 +968,14 @@ def get_stats(days: int = 30, x_admin_key: str = Header(default="")):
             (cutoff,),
         )
         devices = [{"label": r["dev"], "count": r["n"]} for r in cur.fetchall()]
+        cur.execute(
+            """
+            SELECT label, COUNT(*) AS n FROM events
+            WHERE created_at >= %s AND name = 'view' GROUP BY label ORDER BY n DESC LIMIT 10
+            """,
+            (cutoff,),
+        )
+        pages = [{"label": r["label"] or "/", "count": r["n"]} for r in cur.fetchall()]
     finally:
         release_db(conn)
     return {
@@ -712,6 +985,7 @@ def get_stats(days: int = 30, x_admin_key: str = Header(default="")):
         "events": {name: items[:15] for name, items in grouped.items()},
         "sources": sources,
         "devices": devices,
+        "pages": pages,
     }
 
 
