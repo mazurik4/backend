@@ -828,6 +828,66 @@ def gallery_unhide(x_admin_key: str = Header(default="")):
     return {"ok": True, "message": f"Прихованих фото повернуто: {count}. Натисніть «Синхронізувати галерею…»."}
 
 
+class GalleryRename(BaseModel):
+    old: str
+    new: str
+
+
+class GallerySectionName(BaseModel):
+    name: str
+
+
+def _gallery_move_section(old: str, new: str) -> int:
+    """
+    Переносить усі фото розділу old у розділ new. Розділ може бути призначений власником
+    (колонка section) або походити від категорії Google (section порожня) — враховуємо обидва випадки.
+    """
+    keys = [k for k, t in GALLERY_CATEGORY_TITLES.items() if t == old]
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE gallery SET section = %s WHERE section = %s OR (section = '' AND category = ANY(%s))",
+            (new, old, keys),
+        )
+        moved = cur.rowcount
+        conn.commit()
+    finally:
+        release_db(conn)
+    return moved
+
+
+@app.post("/api/gallery/rename")
+def gallery_rename(data: GalleryRename, x_admin_key: str = Header(default="")):
+    """Перейменувати розділ галереї. Якщо нова назва вже існує, розділи обʼєднуються."""
+    check_admin_key(x_admin_key)
+    old = re.sub(r"\s+", " ", data.old).strip()
+    new = re.sub(r"\s+", " ", data.new).strip()[:GALLERY_SECTION_MAX_LEN]
+    if not new:
+        raise HTTPException(status_code=400, detail="Введіть нову назву розділу")
+    if old == GALLERY_DEFAULT_SECTION:
+        raise HTTPException(status_code=400, detail=f"Розділ «{GALLERY_DEFAULT_SECTION}» перейменувати не можна")
+    if new == old:
+        raise HTTPException(status_code=400, detail="Нова назва збігається зі старою")
+    moved = _gallery_move_section(old, new)
+    if not moved:
+        raise HTTPException(status_code=404, detail="Розділ не знайдено")
+    return {"ok": True, "message": f"Розділ «{old}» перейменовано на «{new}» (фото: {moved})"}
+
+
+@app.post("/api/gallery/delete-section")
+def gallery_delete_section(data: GallerySectionName, x_admin_key: str = Header(default="")):
+    """Видалити розділ: усі його фото переходять у «Інше» (самі фото не видаляються)."""
+    check_admin_key(x_admin_key)
+    name = re.sub(r"\s+", " ", data.name).strip()
+    if name == GALLERY_DEFAULT_SECTION:
+        raise HTTPException(status_code=400, detail=f"Розділ «{GALLERY_DEFAULT_SECTION}» видалити не можна")
+    moved = _gallery_move_section(name, GALLERY_DEFAULT_SECTION)
+    if not moved:
+        raise HTTPException(status_code=404, detail="Розділ не знайдено")
+    return {"ok": True, "message": f"Розділ «{name}» видалено, фото ({moved}) перенесено в «{GALLERY_DEFAULT_SECTION}»"}
+
+
 @app.get("/api/gallery")
 def list_gallery():
     """Список медіа для сторінки «Наша галерея». Публічний."""
