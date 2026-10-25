@@ -24,7 +24,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -93,19 +93,97 @@ app.add_middleware(
 # Пул соединений: держим несколько живых подключений к Neon вместо того, чтобы
 # открывать новое TCP/TLS-соединение на каждый запрос — так быстрее, особенно
 # когда карусель новостей разом запрашивает список + 5 фото (6 запросов подряд).
+DB_POOL_SIZE = 10
 db_pool = ThreadedConnectionPool(
-    1, 10, DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor
+    1, DB_POOL_SIZE, DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor
 )
+
+# Сам пул, когда все 10 соединений заняты, не ждёт, а сразу падает с PoolError.
+# Галерея запрашивает 20+ превью разом, и лишние получали ошибку 500 — в браузере
+# это «?» вместо фото (Firefox и старые iPhone шлют такие запросы особенно плотно).
+# Поэтому перед пулом стоит «очередь»: лишний запрос ждёт, пока соединение освободится.
+_db_slots = threading.BoundedSemaphore(DB_POOL_SIZE)
+DB_WAIT_SECONDS = 25
+
+# Neon закрывает соединения, которые долго простаивали (и сама засыпает через ~5 мин).
+# Такое «мёртвое» соединение из пула роняло первый запрос после паузы, поэтому
+# перед выдачей давно не использованного соединения проверяем его коротким SELECT 1.
+DB_IDLE_CHECK_SECONDS = 120
+_db_last_used = {}
+
+
+def _db_alive(conn: psycopg2.extensions.connection) -> bool:
+    if conn.closed:
+        return False
+    last_used = _db_last_used.get(id(conn))
+    if last_used is not None and time.monotonic() - last_used < DB_IDLE_CHECK_SECONDS:
+        return True
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+        conn.rollback()
+        return True
+    except psycopg2.Error:
+        return False
 
 
 def get_db() -> psycopg2.extensions.connection:
-    """Берёт соединение с базой Neon из пула."""
-    return db_pool.getconn()
+    """Берёт соединение с базой Neon из пула (ждёт, если все заняты)."""
+    if not _db_slots.acquire(timeout=DB_WAIT_SECONDS):
+        raise HTTPException(status_code=503, detail="Сервер зайнятий, спробуйте ще раз")
+    try:
+        conn = db_pool.getconn()
+        # после сна Neon «мертвы» обычно все соединения пула разом — выбрасываем
+        # их по очереди; когда пул опустеет, getconn откроет свежее соединение
+        for _ in range(DB_POOL_SIZE):
+            if _db_alive(conn):
+                break
+            db_pool.putconn(conn, close=True)
+            conn = db_pool.getconn()
+        return conn
+    except Exception:
+        _db_slots.release()
+        raise
 
 
 def release_db(conn: psycopg2.extensions.connection) -> None:
     """Возвращает соединение обратно в пул (не закрывает его)."""
-    db_pool.putconn(conn)
+    try:
+        _db_last_used[id(conn)] = time.monotonic()
+        db_pool.putconn(conn, close=bool(conn.closed))
+    finally:
+        _db_slots.release()
+
+
+# Фото новостей и галереи под своим id никогда не меняются, поэтому держим их копии
+# в памяти сервера: повторные показы вообще не ходят в базу и отдаются мгновенно.
+PICTURE_CACHE_LIMIT = 48 * 1024 * 1024  # ~48 МБ — вся галерея (120 фото) с запасом
+_picture_cache = OrderedDict()
+_picture_cache_size = 0
+_picture_cache_lock = threading.Lock()
+
+
+def _cached_picture(key):
+    with _picture_cache_lock:
+        item = _picture_cache.get(key)
+        if item is not None:
+            _picture_cache.move_to_end(key)
+        return item
+
+
+def _remember_picture(key, data: bytes, mime: str) -> None:
+    global _picture_cache_size
+    if len(data) > PICTURE_CACHE_LIMIT // 4:
+        return
+    with _picture_cache_lock:
+        if key in _picture_cache:
+            return
+        _picture_cache[key] = (data, mime)
+        _picture_cache_size += len(data)
+        while _picture_cache_size > PICTURE_CACHE_LIMIT:
+            _, (old, _) = _picture_cache.popitem(last=False)
+            _picture_cache_size -= len(old)
 
 
 def init_db() -> None:
@@ -546,18 +624,23 @@ def list_news():
 @app.get("/api/news/{news_id}/image")
 def get_news_image(news_id: int):
     """Отдаёт фото новости как обычную картинку."""
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT image_data, image_mime FROM news WHERE id = %s", (news_id,))
-        row = cur.fetchone()
-    finally:
-        release_db(conn)
-    if not row:
-        raise HTTPException(status_code=404, detail="Новину не знайдено")
+    key = ("news", news_id)
+    cached = _cached_picture(key)
+    if cached is None:
+        conn = get_db()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT image_data, image_mime FROM news WHERE id = %s", (news_id,))
+            row = cur.fetchone()
+        finally:
+            release_db(conn)
+        if not row:
+            raise HTTPException(status_code=404, detail="Новину не знайдено")
+        cached = (bytes(row["image_data"]), row["image_mime"])
+        _remember_picture(key, *cached)
     return Response(
-        content=bytes(row["image_data"]),
-        media_type=row["image_mime"],
+        content=cached[0],
+        media_type=cached[1],
         headers={"Cache-Control": "public, max-age=86400"},
     )
 
@@ -936,17 +1019,22 @@ def list_gallery():
 
 
 def _gallery_picture(media_id: int, column: str):
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute(f"SELECT {column} AS data FROM gallery WHERE id = %s", (media_id,))
-        row = cur.fetchone()
-    finally:
-        release_db(conn)
-    if not row:
-        raise HTTPException(status_code=404, detail="Фото не знайдено")
+    key = ("gallery", media_id, column)
+    cached = _cached_picture(key)
+    if cached is None:
+        conn = get_db()
+        try:
+            cur = conn.cursor()
+            cur.execute(f"SELECT {column} AS data FROM gallery WHERE id = %s", (media_id,))
+            row = cur.fetchone()
+        finally:
+            release_db(conn)
+        if not row:
+            raise HTTPException(status_code=404, detail="Фото не знайдено")
+        cached = (bytes(row["data"]), "image/jpeg")
+        _remember_picture(key, *cached)
     return Response(
-        content=bytes(row["data"]),
+        content=cached[0],
         media_type="image/jpeg",
         headers={"Cache-Control": "public, max-age=604800, immutable"},
     )
