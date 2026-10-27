@@ -59,7 +59,7 @@ if not DATABASE_URL:
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "change-me-locally-for-dev")
 
 # Новини для каруселі на сайті: скільки останніх зберігати і обмеження на вхідні дані.
-NEWS_LIMIT = 5
+NEWS_LIMIT = 8
 NEWS_MAX_TEXT_LEN = 300
 NEWS_IMAGE_MAX_WIDTH = 1200
 
