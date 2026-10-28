@@ -64,6 +64,7 @@ NEWS_LIMIT = 8
 NEWS_MAX_TEXT_LEN = 300
 NEWS_ARCHIVE_LIMIT = 300  # запобіжник: більше постів у базі не тримаємо
 NEWS_IMAGE_MAX_WIDTH = 1600  # фото поста на сторінці «Наші роботи» показується великим
+NEWS_THUMB_WIDTHS = (640,)  # дозволені зменшені копії: ?w=640 для карток каруселі й архіву
 
 # Автосинхронізація постів з Google Business Profile. Вмикається, лише якщо задані
 # ВСІ п'ять змінних оточення (на Render: Environment). Без них нові новини не з'являються.
@@ -589,6 +590,8 @@ def sync_google_posts() -> dict:
         # кеш чистимо лише після commit, інакше паралельний запит міг би знову закешувати старе фото
         for news_id in refreshed_ids:
             _forget_picture(("news", news_id))
+            for w in NEWS_THUMB_WIDTHS:
+                _forget_picture(("news", news_id, w))
 
         message = (
             f"Google повернув постів: {len(posts)}; активних: {live_count}; "
@@ -704,8 +707,17 @@ def news_archive():
 
 
 @app.get("/api/news/{news_id}/image")
-def get_news_image(news_id: int):
-    """Отдаёт фото новости как обычную картинку."""
+def get_news_image(news_id: int, w: int = 0):
+    """Отдаёт фото новости как обычную картинку; ?w=640 — уменьшенная копия для карточек."""
+    if w and w not in NEWS_THUMB_WIDTHS:
+        raise HTTPException(status_code=400, detail="Недоступний розмір")
+    if w:
+        thumb = _cached_picture(("news", news_id, w))
+        if thumb is None:
+            full = get_news_image(news_id)
+            thumb = _compress_image(full.body, w, 80)
+            _remember_picture(("news", news_id, w), *thumb)
+        return Response(content=thumb[0], media_type=thumb[1], headers={"Cache-Control": "public, max-age=86400"})
     key = ("news", news_id)
     cached = _cached_picture(key)
     if cached is None:
