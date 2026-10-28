@@ -63,7 +63,7 @@ ADMIN_KEY = os.environ.get("ADMIN_KEY", "change-me-locally-for-dev")
 NEWS_LIMIT = 8
 NEWS_MAX_TEXT_LEN = 300
 NEWS_ARCHIVE_LIMIT = 300  # запобіжник: більше постів у базі не тримаємо
-NEWS_IMAGE_MAX_WIDTH = 1200
+NEWS_IMAGE_MAX_WIDTH = 1600  # фото поста на сторінці «Наші роботи» показується великим
 
 # Автосинхронізація постів з Google Business Profile. Вмикається, лише якщо задані
 # ВСІ п'ять змінних оточення (на Render: Environment). Без них нові новини не з'являються.
@@ -174,6 +174,14 @@ def _cached_picture(key):
         return item
 
 
+def _forget_picture(key) -> None:
+    global _picture_cache_size
+    with _picture_cache_lock:
+        item = _picture_cache.pop(key, None)
+        if item is not None:
+            _picture_cache_size -= len(item[0])
+
+
 def _remember_picture(key, data: bytes, mime: str) -> None:
     global _picture_cache_size
     if len(data) > PICTURE_CACHE_LIMIT // 4:
@@ -225,6 +233,9 @@ def init_db() -> None:
         cur.execute("ALTER TABLE news ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual'")
         cur.execute("ALTER TABLE news ADD COLUMN IF NOT EXISTS external_id TEXT")
         cur.execute("ALTER TABLE news ADD COLUMN IF NOT EXISTS post_url TEXT NOT NULL DEFAULT ''")
+        # Раніше фото постів бралися в розмірі, який Google віддає за замовчуванням (512 px).
+        # image_hd = фото вже перекачане у великому розмірі; старі синхронізація перекачає сама.
+        cur.execute("ALTER TABLE news ADD COLUMN IF NOT EXISTS image_hd BOOLEAN NOT NULL DEFAULT FALSE")
         cur.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS news_external_id_uq ON news (external_id) WHERE external_id IS NOT NULL"
         )
@@ -521,11 +532,12 @@ def sync_google_posts() -> dict:
 
         added = 0
         updated = 0
+        refreshed_ids = []
         skipped = 0
         conn = get_db()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT external_id, text, post_url FROM news WHERE external_id IS NOT NULL")
+            cur.execute("SELECT id, external_id, text, post_url, image_hd FROM news WHERE external_id IS NOT NULL")
             stored = {r["external_id"]: r for r in cur.fetchall()}
             cur.execute("SELECT external_id FROM news_ignored")
             ignored = {r["external_id"] for r in cur.fetchall()}
@@ -544,16 +556,27 @@ def sync_google_posts() -> dict:
                             (c["text"], c["url"] or old["post_url"], c["external_id"]),
                         )
                         updated += cur.rowcount
+                    if not old["image_hd"]:
+                        try:
+                            image_data, image_mime = _compress_image(_download(_gbp_sized(c["image"], NEWS_IMAGE_MAX_WIDTH)))
+                        except Exception as exc:  # не вийшло — спробуємо при наступній синхронізації
+                            print(f"[gbp-sync] не вдалося оновити фото {c['external_id']}: {exc}")
+                        else:
+                            cur.execute(
+                                "UPDATE news SET image_data = %s, image_mime = %s, image_hd = TRUE WHERE id = %s",
+                                (psycopg2.Binary(image_data), image_mime, old["id"]),
+                            )
+                            refreshed_ids.append(old["id"])
                     continue
                 try:
-                    image_data, image_mime = _compress_image(_download(c["image"]))
+                    image_data, image_mime = _compress_image(_download(_gbp_sized(c["image"], NEWS_IMAGE_MAX_WIDTH)))
                 except Exception as exc:  # одне погане фото не має ламати решту
                     print(f"[gbp-sync] пропускаю {c['external_id']}: фото не завантажилось ({exc})")
                     continue
                 cur.execute(
                     """
-                    INSERT INTO news (text, image_data, image_mime, created_at, source, external_id, post_url)
-                    VALUES (%s, %s, %s, %s, 'google', %s, %s)
+                    INSERT INTO news (text, image_data, image_mime, created_at, source, external_id, post_url, image_hd)
+                    VALUES (%s, %s, %s, %s, 'google', %s, %s, TRUE)
                     ON CONFLICT DO NOTHING
                     """,
                     (c["text"], psycopg2.Binary(image_data), image_mime, c["created_at"], c["external_id"], c["url"]),
@@ -563,6 +586,9 @@ def sync_google_posts() -> dict:
             conn.commit()
         finally:
             release_db(conn)
+        # кеш чистимо лише після commit, інакше паралельний запит міг би знову закешувати старе фото
+        for news_id in refreshed_ids:
+            _forget_picture(("news", news_id))
 
         message = (
             f"Google повернув постів: {len(posts)}; активних: {live_count}; "
@@ -570,6 +596,8 @@ def sync_google_posts() -> dict:
         )
         if updated:
             message += f"; оновлено текст: {updated}"
+        if refreshed_ids:
+            message += f"; фото у високій якості: {len(refreshed_ids)}"
         if skipped:
             message += f"; пропущено (приховані вами): {skipped}"
         _last_sync_result = {"ok": True, "message": message, "added": added}
@@ -616,7 +644,7 @@ def _news_rows(limit: int):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, text, created_at, source, post_url FROM news
+            SELECT id, text, created_at, source, post_url, image_hd FROM news
             ORDER BY created_at DESC, id DESC LIMIT %s
             """,
             (limit,),
@@ -624,6 +652,11 @@ def _news_rows(limit: int):
         return cur.fetchall()
     finally:
         release_db(conn)
+
+
+def _news_image_url(row) -> str:
+    # мітка версії: після перекачування фото браузери й сайт не тримають стару маленьку копію
+    return f"/api/news/{row['id']}/image" + ("?v=hd" if row["image_hd"] else "")
 
 
 def _short_text(text: str) -> str:
@@ -643,7 +676,7 @@ def list_news():
             "id": row["id"],
             "text": _short_text(row["text"]),
             "created_at": row["created_at"],
-            "image_url": f"/api/news/{row['id']}/image",
+            "image_url": _news_image_url(row),
             "source": row["source"],
             "url": row["post_url"],
         }
@@ -663,7 +696,7 @@ def news_archive():
             "id": row["id"],
             "text": row["text"],
             "created_at": row["created_at"],
-            "image_url": f"/api/news/{row['id']}/image",
+            "image_url": _news_image_url(row),
             "url": row["post_url"],
         }
         for row in _news_rows(NEWS_ARCHIVE_LIMIT)
