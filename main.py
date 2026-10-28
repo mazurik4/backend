@@ -58,9 +58,11 @@ if not DATABASE_URL:
 # Ключ для доступа к списку заявок — тоже из переменной окружения.
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "change-me-locally-for-dev")
 
-# Новини для каруселі на сайті: скільки останніх зберігати і обмеження на вхідні дані.
+# Новини: карусель на головній показує NEWS_LIMIT останніх з текстом до NEWS_MAX_TEXT_LEN,
+# а архів «Наші роботи» (/api/news/archive) — усі пости з повним текстом.
 NEWS_LIMIT = 8
 NEWS_MAX_TEXT_LEN = 300
+NEWS_ARCHIVE_LIMIT = 300  # запобіжник: більше постів у базі не тримаємо
 NEWS_IMAGE_MAX_WIDTH = 1200
 
 # Автосинхронізація постів з Google Business Profile. Вмикається, лише якщо задані
@@ -404,14 +406,14 @@ def _compress_image(raw: bytes, max_width: int = NEWS_IMAGE_MAX_WIDTH, quality: 
 
 
 def _prune_news(cur) -> None:
-    """Оставляет только NEWS_LIMIT самых новых новостей (за датою, а не за id)."""
+    """Оставляет только NEWS_ARCHIVE_LIMIT самых новых новостей (за датою, а не за id)."""
     cur.execute(
         """
         DELETE FROM news WHERE id NOT IN (
             SELECT id FROM news ORDER BY created_at DESC, id DESC LIMIT %s
         )
         """,
-        (NEWS_LIMIT,),
+        (NEWS_ARCHIVE_LIMIT,),
     )
 
 
@@ -464,8 +466,9 @@ _last_sync_result = {"ok": None, "message": "Синхронізація ще н�
 
 def sync_google_posts() -> dict:
     """
-    Тягне останні пости з Google Business Profile й додає нові в таблицю news.
-    Пости без фото пропускаються (карусель показує фото + текст).
+    Тягне всі пости з Google Business Profile й додає нові в таблицю news (повний текст).
+    У вже збережених оновлює текст, якщо його змінили в Google.
+    Пости без фото пропускаються (карусель і архів показують фото + текст).
     Повертає {"ok", "message", "added"}; помилки не кидає, а повертає текстом.
     """
     global _last_sync_at, _last_sync_result
@@ -475,11 +478,21 @@ def sync_google_posts() -> dict:
         return {"ok": True, "message": "Синхронізація вже виконується", "added": 0}
     try:
         token = _gbp_access_token()
-        url = (
+        base = (
             f"https://mybusiness.googleapis.com/v4/accounts/{GBP_ACCOUNT_ID}"
-            f"/locations/{GBP_LOCATION_ID}/localPosts?pageSize=20"
+            f"/locations/{GBP_LOCATION_ID}/localPosts?pageSize=100"
         )
-        posts = _http_json(url, headers={"Authorization": f"Bearer {token}"}).get("localPosts", [])
+        posts = []
+        page_token = ""
+        for _ in range(5):  # до 500 постів, з запасом
+            page = _http_json(
+                base + (f"&pageToken={urllib.parse.quote(page_token)}" if page_token else ""),
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            posts += page.get("localPosts", [])
+            page_token = page.get("nextPageToken") or ""
+            if not page_token:
+                break
 
         candidates = []
         live_count = 0
@@ -495,8 +508,6 @@ def sync_google_posts() -> dict:
             )
             if not summary or not media:
                 continue
-            if len(summary) > NEWS_MAX_TEXT_LEN:
-                summary = summary[: NEWS_MAX_TEXT_LEN - 1].rstrip() + "…"
             candidates.append({
                 "external_id": post["name"],
                 "text": summary,
@@ -506,27 +517,33 @@ def sync_google_posts() -> dict:
             })
         candidates.sort(key=lambda c: c["created_at"], reverse=True)
         eligible_count = len(candidates)
-        candidates = candidates[:NEWS_LIMIT]
+        candidates = candidates[:NEWS_ARCHIVE_LIMIT]
 
         added = 0
+        updated = 0
         skipped = 0
         conn = get_db()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT external_id FROM news WHERE external_id IS NOT NULL")
-            known = {r["external_id"] for r in cur.fetchall()}
+            cur.execute("SELECT external_id, text, post_url FROM news WHERE external_id IS NOT NULL")
+            stored = {r["external_id"]: r for r in cur.fetchall()}
             cur.execute("SELECT external_id FROM news_ignored")
-            known |= {r["external_id"] for r in cur.fetchall()}
-            cur.execute("SELECT created_at FROM news ORDER BY created_at DESC, id DESC LIMIT %s", (NEWS_LIMIT,))
-            kept = [r["created_at"] for r in cur.fetchall()]
-            oldest_kept = kept[-1] if len(kept) >= NEWS_LIMIT else None
+            ignored = {r["external_id"] for r in cur.fetchall()}
 
             for c in candidates:
-                if c["external_id"] in known:
-                    skipped += 1  # вже на сайті або прихований вами
+                if c["external_id"] in ignored:
+                    skipped += 1  # прихований вами в адмінці
                     continue
-                if oldest_kept and c["created_at"] <= oldest_kept:
-                    skipped += 1  # старіший за ті, що вже показуються, — не потрібен
+                old = stored.get(c["external_id"])
+                if old:
+                    # уже збережений: оновлюємо текст (раніше зберігали лише перші 300 символів,
+                    # а ще пост могли відредагувати в Google)
+                    if old["text"] != c["text"] or (c["url"] and old["post_url"] != c["url"]):
+                        cur.execute(
+                            "UPDATE news SET text = %s, post_url = %s WHERE external_id = %s",
+                            (c["text"], c["url"] or old["post_url"], c["external_id"]),
+                        )
+                        updated += cur.rowcount
                     continue
                 try:
                     image_data, image_mime = _compress_image(_download(c["image"]))
@@ -551,8 +568,10 @@ def sync_google_posts() -> dict:
             f"Google повернув постів: {len(posts)}; активних: {live_count}; "
             f"з фото і текстом: {eligible_count}; додано нових: {added}"
         )
+        if updated:
+            message += f"; оновлено текст: {updated}"
         if skipped:
-            message += f"; пропущено (вже на сайті, приховані або старіші): {skipped}"
+            message += f"; пропущено (приховані вами): {skipped}"
         _last_sync_result = {"ok": True, "message": message, "added": added}
     except Exception as exc:
         print(f"[gbp-sync] помилка: {exc}")
@@ -591,10 +610,7 @@ def unhide_news(x_admin_key: str = Header(default="")):
     return {"ok": True, "message": f"Прихованих постів повернуто: {count}. Натисніть «Синхронізувати з Google зараз»."}
 
 
-@app.get("/api/news")
-def list_news():
-    """Останні новини для каруселі на сайті. Доступно всім, без ключа."""
-    _maybe_sync_in_background()
+def _news_rows(limit: int):
     conn = get_db()
     try:
         cur = conn.cursor()
@@ -603,21 +619,54 @@ def list_news():
             SELECT id, text, created_at, source, post_url FROM news
             ORDER BY created_at DESC, id DESC LIMIT %s
             """,
-            (NEWS_LIMIT,),
+            (limit,),
         )
-        rows = cur.fetchall()
+        return cur.fetchall()
     finally:
         release_db(conn)
+
+
+def _short_text(text: str) -> str:
+    """Карусель показує лише початок поста (повний текст — на сторінці роботи)."""
+    if len(text) <= NEWS_MAX_TEXT_LEN:
+        return text
+    return text[: NEWS_MAX_TEXT_LEN - 1].rstrip() + "…"
+
+
+@app.get("/api/news")
+def list_news():
+    """Останні новини для каруселі на сайті. Доступно всім, без ключа."""
+    _maybe_sync_in_background()
+    rows = _news_rows(NEWS_LIMIT)
     return [
         {
             "id": row["id"],
-            "text": row["text"],
+            "text": _short_text(row["text"]),
             "created_at": row["created_at"],
             "image_url": f"/api/news/{row['id']}/image",
             "source": row["source"],
             "url": row["post_url"],
         }
         for row in rows
+    ]
+
+
+@app.get("/api/news/archive")
+def news_archive():
+    """
+    Усі пости з повним текстом — для сторінок «Наші роботи» на сайті.
+    Їх збирає tools/build_news.py у репозиторії сайту (GitHub Actions, кілька разів на день).
+    """
+    _maybe_sync_in_background()
+    return [
+        {
+            "id": row["id"],
+            "text": row["text"],
+            "created_at": row["created_at"],
+            "image_url": f"/api/news/{row['id']}/image",
+            "url": row["post_url"],
+        }
+        for row in _news_rows(NEWS_ARCHIVE_LIMIT)
     ]
 
 
