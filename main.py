@@ -65,6 +65,7 @@ NEWS_MAX_TEXT_LEN = 300
 NEWS_ARCHIVE_LIMIT = 300  # запобіжник: більше постів у базі не тримаємо
 NEWS_IMAGE_MAX_WIDTH = 1600  # фото поста на сторінці «Наші роботи» показується великим
 NEWS_THUMB_WIDTHS = (640,)  # дозволені зменшені копії: ?w=640 для карток каруселі й архіву
+NEWS_MAX_PHOTOS = 10  # скільки фото одного поста зберігаємо (Google дозволяє до 10)
 
 # Автосинхронізація постів з Google Business Profile. Вмикається, лише якщо задані
 # ВСІ п'ять змінних оточення (на Render: Environment). Без них нові новини не з'являються.
@@ -237,6 +238,18 @@ def init_db() -> None:
         # Раніше фото постів бралися в розмірі, який Google віддає за замовчуванням (512 px).
         # image_hd = фото вже перекачане у великому розмірі; старі синхронізація перекачає сама.
         cur.execute("ALTER TABLE news ADD COLUMN IF NOT EXISTS image_hd BOOLEAN NOT NULL DEFAULT FALSE")
+        # Решта фото поста (перше лежить у news.image_data). pos — порядок у пості Google, з 1.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS news_photos (
+                news_id INTEGER NOT NULL REFERENCES news(id) ON DELETE CASCADE,
+                pos INTEGER NOT NULL,
+                image_data BYTEA NOT NULL,
+                image_mime TEXT NOT NULL,
+                PRIMARY KEY (news_id, pos)
+            )
+            """
+        )
         cur.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS news_external_id_uq ON news (external_id) WHERE external_id IS NOT NULL"
         )
@@ -513,18 +526,19 @@ def sync_google_posts() -> dict:
                 continue
             live_count += 1
             summary = (post.get("summary") or "").strip()
-            media = next(
-                (m for m in post.get("media", []) if m.get("mediaFormat", "PHOTO") == "PHOTO"
-                 and (m.get("googleUrl") or m.get("sourceUrl"))),
-                None,
-            )
-            if not summary or not media:
+            photos = [
+                m.get("googleUrl") or m.get("sourceUrl")
+                for m in post.get("media", [])
+                if m.get("mediaFormat", "PHOTO") == "PHOTO" and (m.get("googleUrl") or m.get("sourceUrl"))
+            ][:NEWS_MAX_PHOTOS]
+            if not summary or not photos:
                 continue
             candidates.append({
                 "external_id": post["name"],
                 "text": summary,
                 "created_at": _gbp_iso_to_naive_utc(post["createTime"]),
-                "image": media.get("googleUrl") or media.get("sourceUrl"),
+                "image": photos[0],
+                "extra": photos[1:],
                 "url": post.get("searchUrl") or "",
             })
         candidates.sort(key=lambda c: c["created_at"], reverse=True)
@@ -534,12 +548,15 @@ def sync_google_posts() -> dict:
         added = 0
         updated = 0
         refreshed_ids = []
+        extra_ids = []
         skipped = 0
         conn = get_db()
         try:
             cur = conn.cursor()
             cur.execute("SELECT id, external_id, text, post_url, image_hd FROM news WHERE external_id IS NOT NULL")
             stored = {r["external_id"]: r for r in cur.fetchall()}
+            cur.execute("SELECT news_id, COUNT(*) AS n FROM news_photos GROUP BY news_id")
+            extra_stored = {r["news_id"]: r["n"] for r in cur.fetchall()}
             cur.execute("SELECT external_id FROM news_ignored")
             ignored = {r["external_id"] for r in cur.fetchall()}
 
@@ -568,6 +585,8 @@ def sync_google_posts() -> dict:
                                 (psycopg2.Binary(image_data), image_mime, old["id"]),
                             )
                             refreshed_ids.append(old["id"])
+                    if extra_stored.get(old["id"], 0) != len(c["extra"]) and _save_extra_photos(cur, old["id"], c):
+                        extra_ids.append(old["id"])
                     continue
                 try:
                     image_data, image_mime = _compress_image(_download(_gbp_sized(c["image"], NEWS_IMAGE_MAX_WIDTH)))
@@ -579,10 +598,15 @@ def sync_google_posts() -> dict:
                     INSERT INTO news (text, image_data, image_mime, created_at, source, external_id, post_url, image_hd)
                     VALUES (%s, %s, %s, %s, 'google', %s, %s, TRUE)
                     ON CONFLICT DO NOTHING
+                    RETURNING id
                     """,
                     (c["text"], psycopg2.Binary(image_data), image_mime, c["created_at"], c["external_id"], c["url"]),
                 )
-                added += cur.rowcount
+                new_row = cur.fetchone()
+                if new_row:
+                    added += 1
+                    if c["extra"]:
+                        _save_extra_photos(cur, new_row["id"], c)
             _prune_news(cur)
             conn.commit()
         finally:
@@ -592,6 +616,10 @@ def sync_google_posts() -> dict:
             _forget_picture(("news", news_id))
             for w in NEWS_THUMB_WIDTHS:
                 _forget_picture(("news", news_id, w))
+        for news_id in extra_ids:
+            for pos in range(1, NEWS_MAX_PHOTOS):
+                for w in (0,) + NEWS_THUMB_WIDTHS:
+                    _forget_picture(("news-photo", news_id, pos, w))
 
         message = (
             f"Google повернув постів: {len(posts)}; активних: {live_count}; "
@@ -601,6 +629,13 @@ def sync_google_posts() -> dict:
             message += f"; оновлено текст: {updated}"
         if refreshed_ids:
             message += f"; фото у високій якості: {len(refreshed_ids)}"
+        multi = [len(c["extra"]) + 1 for c in candidates if c["extra"]]
+        message += (
+            f"; постів з кількома фото: {len(multi)}"
+            + (f" (усього фото в них: {sum(multi)})" if multi else "")
+        )
+        if extra_ids:
+            message += f"; оновлено додаткові фото: {len(extra_ids)}"
         if skipped:
             message += f"; пропущено (приховані вами): {skipped}"
         _last_sync_result = {"ok": True, "message": message, "added": added}
@@ -611,6 +646,22 @@ def sync_google_posts() -> dict:
         _last_sync_at = time.time()
         _sync_lock.release()
     return _last_sync_result
+
+
+def _save_extra_photos(cur, news_id: int, c: dict) -> bool:
+    """Перезаписує додаткові фото поста (2-ге, 3-тє…). False — якесь не завантажилось, спробуємо пізніше."""
+    try:
+        pictures = [_compress_image(_download(_gbp_sized(url, NEWS_IMAGE_MAX_WIDTH))) for url in c["extra"]]
+    except Exception as exc:
+        print(f"[gbp-sync] не вдалося завантажити додаткові фото {c['external_id']}: {exc}")
+        return False
+    cur.execute("DELETE FROM news_photos WHERE news_id = %s", (news_id,))
+    for pos, (data, mime) in enumerate(pictures, start=1):
+        cur.execute(
+            "INSERT INTO news_photos (news_id, pos, image_data, image_mime) VALUES (%s, %s, %s, %s)",
+            (news_id, pos, psycopg2.Binary(data), mime),
+        )
+    return True
 
 
 def _maybe_sync_in_background() -> None:
@@ -694,16 +745,53 @@ def news_archive():
     Їх збирає tools/build_news.py у репозиторії сайту (GitHub Actions, кілька разів на день).
     """
     _maybe_sync_in_background()
+    rows = _news_rows(NEWS_ARCHIVE_LIMIT)
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT news_id, pos FROM news_photos ORDER BY news_id, pos")
+        extra = {}
+        for r in cur.fetchall():
+            extra.setdefault(r["news_id"], []).append(f"/api/news/{r['news_id']}/photo/{r['pos']}")
+    finally:
+        release_db(conn)
     return [
         {
             "id": row["id"],
             "text": row["text"],
             "created_at": row["created_at"],
             "image_url": _news_image_url(row),
+            "photos": extra.get(row["id"], []),  # решта фото поста, крім першого
             "url": row["post_url"],
         }
-        for row in _news_rows(NEWS_ARCHIVE_LIMIT)
+        for row in rows
     ]
+
+
+@app.get("/api/news/{news_id}/photo/{pos}")
+def get_news_photo(news_id: int, pos: int, w: int = 0):
+    """Додаткове фото поста (pos з 1); ?w=640 — зменшена копія для мініатюр."""
+    if w and w not in NEWS_THUMB_WIDTHS:
+        raise HTTPException(status_code=400, detail="Недоступний розмір")
+    key = ("news-photo", news_id, pos, w)
+    cached = _cached_picture(key)
+    if cached is None:
+        if w:
+            full = get_news_photo(news_id, pos)
+            cached = _compress_image(full.body, w, 80)
+        else:
+            conn = get_db()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT image_data, image_mime FROM news_photos WHERE news_id = %s AND pos = %s", (news_id, pos))
+                row = cur.fetchone()
+            finally:
+                release_db(conn)
+            if not row:
+                raise HTTPException(status_code=404, detail="Фото не знайдено")
+            cached = (bytes(row["image_data"]), row["image_mime"])
+        _remember_picture(key, *cached)
+    return Response(content=cached[0], media_type=cached[1], headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.get("/api/news/{news_id}/image")
