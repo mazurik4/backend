@@ -1161,7 +1161,7 @@ def list_gallery():
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, category, section, media_type, width, height, created_at FROM gallery ORDER BY created_at DESC, id DESC"
+            "SELECT id, external_id, category, section, media_type, width, height, created_at FROM gallery ORDER BY created_at DESC, id DESC"
         )
         rows = cur.fetchall()
     finally:
@@ -1179,6 +1179,8 @@ def list_gallery():
             "created_at": r["created_at"],
             "image_url": f"/api/gallery/{r['id']}/image",
             "thumb_url": f"/api/gallery/{r['id']}/thumb",
+            # ключ медіа в Google (хвіст імені): за ним сайт веде на конкретне відео
+            "media_key": (r["external_id"] or "").rsplit("/", 1)[-1],
         })
     counts = defaultdict(int)
     newest = {}
