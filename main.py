@@ -292,6 +292,9 @@ def init_db() -> None:
         # і список прихованих фото, щоб синхронізація не повертала їх.
         cur.execute("ALTER TABLE gallery ADD COLUMN IF NOT EXISTS section TEXT NOT NULL DEFAULT ''")
         cur.execute("CREATE TABLE IF NOT EXISTS gallery_ignored (external_id TEXT PRIMARY KEY)")
+        # Саме відео (mp4) для відтворення на сайті; для фото порожньо. Google віддає лише кадр-превʼю в API,
+        # але файл доступний за ключем медіа з суфіксом =m18 (див. _fetch_gallery_videos).
+        cur.execute("ALTER TABLE gallery ADD COLUMN IF NOT EXISTS video_data BYTEA")
         conn.commit()
     finally:
         release_db(conn)
@@ -863,6 +866,7 @@ GALLERY_BATCH = 15           # скільки нових медіа завант
 GALLERY_IMAGE_WIDTH = 1400   # велике фото для перегляду
 GALLERY_THUMB_WIDTH = 640    # превʼю в сітці
 GALLERY_SKIP_CATEGORIES = {"COVER", "PROFILE", "LOGO"}
+GALLERY_VIDEO_MAX_BYTES = 30 * 1024 * 1024  # довші ролики не зберігаємо: вони б роздули базу
 GBP_PROFILE_URL = "https://www.google.com/maps?cid=15792600053340114773"
 
 # (ключ Google, назва на сайті) — у такому порядку показуємо розділи
@@ -894,6 +898,52 @@ def _image_size(data: bytes):
             return im.width, im.height
     except Exception:
         return 0, 0
+
+
+def _download_video(url: str) -> bytes:
+    """Завантажує відео цілком (не обрізаючи, як _download). Занадто велике або не mp4 — помилка."""
+    req = urllib.request.Request(url, headers={"User-Agent": "autoworkshop-news-sync"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        if "video" not in (resp.headers.get("Content-Type") or ""):
+            raise ValueError(f"не відео: {resp.headers.get('Content-Type')}")
+        data = resp.read(GALLERY_VIDEO_MAX_BYTES + 1)
+    if len(data) > GALLERY_VIDEO_MAX_BYTES:
+        raise ValueError("відео завелике")
+    return data
+
+
+def _fetch_gallery_videos(conn) -> int:
+    """Докачує файли відео для рядків галереї типу VIDEO, у яких його ще немає. Повертає, скільки збережено."""
+    cur = conn.cursor()
+    cur.execute("SELECT id, external_id FROM gallery WHERE media_type = 'VIDEO' AND video_data IS NULL")
+    saved = 0
+    for r in cur.fetchall():
+        media_key = (r["external_id"] or "").rsplit("/", 1)[-1]
+        if not media_key:
+            continue
+        try:
+            data = _download_video(f"https://lh3.googleusercontent.com/p/{media_key}=m18")
+        except Exception as exc:  # не вийшло — спробуємо при наступній синхронізації
+            print(f"[gbp-gallery] відео {r['external_id']}: {exc}")
+            continue
+        cur.execute("UPDATE gallery SET video_data = %s WHERE id = %s", (psycopg2.Binary(data), r["id"]))
+        conn.commit()
+        _forget_picture(("gallery-video", r["id"]))
+        saved += 1
+    return saved
+
+
+def _parse_range(header: str, total: int):
+    """'bytes=0-1023' -> (0, 1023); 'bytes=500-' -> (500, total-1); 'bytes=-200' -> останні 200 байтів. None — не діапазон."""
+    m = re.fullmatch(r"bytes=(\d*)-(\d*)", (header or "").strip())
+    if not m or (m.group(1) == "" and m.group(2) == ""):
+        return None
+    if m.group(1) == "":
+        n = int(m.group(2))
+        return (max(total - n, 0), total - 1)
+    start = int(m.group(1))
+    end = int(m.group(2)) if m.group(2) else total - 1
+    return (start, min(end, total - 1))
 
 
 def sync_google_gallery(max_new: int = None) -> dict:
@@ -986,6 +1036,7 @@ def sync_google_gallery(max_new: int = None) -> dict:
             if usable:  # прибираємо те, що власник видалив у Google (лише якщо список не порожній)
                 cur.execute("DELETE FROM gallery WHERE external_id <> ALL(%s)", ([u["external_id"] for u in usable],))
             conn.commit()
+            videos_saved = _fetch_gallery_videos(conn)
             cur.execute("SELECT COUNT(*) AS n FROM gallery")
             total = cur.fetchone()["n"]
         finally:
@@ -996,6 +1047,8 @@ def sync_google_gallery(max_new: int = None) -> dict:
             f"Google повернув медіа: {len(media)}; підходить для галереї: {len(usable)}"
             f"{' (' + parts + ')' if parts else ''}; додано нових: {added}; на сайті: {total}"
         )
+        if videos_saved:
+            message += f"; відео збережено для відтворення на сайті: {videos_saved}"
         if remaining:
             message += f". Залишилось завантажити: {remaining} — натисніть кнопку ще раз"
         return {"ok": True, "message": message, "added": added, "remaining": remaining}
@@ -1161,7 +1214,7 @@ def list_gallery():
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, external_id, category, section, media_type, width, height, created_at FROM gallery ORDER BY created_at DESC, id DESC"
+            "SELECT id, external_id, category, section, media_type, width, height, created_at, (video_data IS NOT NULL) AS has_video FROM gallery ORDER BY created_at DESC, id DESC"
         )
         rows = cur.fetchall()
     finally:
@@ -1181,6 +1234,8 @@ def list_gallery():
             "thumb_url": f"/api/gallery/{r['id']}/thumb",
             # ключ медіа в Google (хвіст імені): за ним сайт веде на конкретне відео
             "media_key": (r["external_id"] or "").rsplit("/", 1)[-1],
+            # якщо файл відео збережено — сайт відтворює його сам, інакше веде в Google
+            "video_url": f"/api/gallery/{r['id']}/video" if r["has_video"] else None,
         })
     counts = defaultdict(int)
     newest = {}
@@ -1227,6 +1282,36 @@ def _gallery_picture(media_id: int, column: str):
 @app.get("/api/gallery/{media_id}/image")
 def gallery_image(media_id: int):
     return _gallery_picture(media_id, "image_data")
+
+
+@app.get("/api/gallery/{media_id}/video")
+def gallery_video(media_id: int, request: Request):
+    """Відео для відтворення на сайті. Підтримує Range: без нього Safari на iPhone не грає відео."""
+    key = ("gallery-video", media_id)
+    cached = _cached_picture(key)
+    if cached is None:
+        conn = get_db()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT video_data FROM gallery WHERE id = %s", (media_id,))
+            row = cur.fetchone()
+        finally:
+            release_db(conn)
+        if not row or row["video_data"] is None:
+            raise HTTPException(status_code=404, detail="Відео не знайдено")
+        cached = (bytes(row["video_data"]), "video/mp4")
+        _remember_picture(key, *cached)
+    data = cached[0]
+    total = len(data)
+    headers = {"Accept-Ranges": "bytes", "Cache-Control": "public, max-age=86400"}
+    span = _parse_range(request.headers.get("range", ""), total)
+    if span is None:
+        return Response(content=data, media_type="video/mp4", headers=headers)
+    start, end = span
+    if start >= total or start > end:
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
+    headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+    return Response(content=data[start:end + 1], status_code=206, media_type="video/mp4", headers=headers)
 
 
 @app.get("/api/gallery/{media_id}/thumb")
